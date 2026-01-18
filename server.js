@@ -15,6 +15,11 @@
 //
 // ✅ DEDUPE FIX:
 // - seenKey() now includes orders hash when present so duplicate BATCH alerts dedupe correctly
+//
+// ✅ PAGINATION FIX (your “old 17 Jan order not cancelled” issue):
+// - listOpenOrdersAllPages() now paginates until EMPTY page (not arr.length < per_page)
+// - uses safer perPage=50 because exchanges often silently cap per_page
+// - includes page logging so you can verify it’s pulling all pages
 
 require('dotenv').config();
 const express = require('express');
@@ -548,6 +553,8 @@ async function cancelOrdersBySymbol(psym, { fallbackAll=false } = {}){
   }
 
   const mine = open.filter(o => safeUpper(o?.product_symbol||o?.symbol) === safeUpper(sym));
+  console.log('cancelOrdersBySymbol', { sym, openCount: open.length, mineCount: mine.length });
+
   if (!mine.length) return { ok:true, skipped:true, reason:'no_open_orders_for_symbol', symbol: sym };
 
   let cancelled = 0, failed = 0;
@@ -573,17 +580,24 @@ async function cancelOrdersBySymbol(psym, { fallbackAll=false } = {}){
   return { ok:true, cancelled, failed, symbol: sym };
 }
 
+// ✅ PAGINATION FIX HERE
 async function listOpenOrdersAllPages(){
+  const perPage  = 50;   // safer: exchanges often cap per_page silently
+  const maxPages = 50;   // safety guard
   let all = [];
   let page = 1;
-  while (true){
-    const q = `?states=open,pending&page=${page}&per_page=200`;
+
+  while (page <= maxPages){
+    const q = `?states=open,pending&page=${page}&per_page=${perPage}`;
     const oo = await dcall('GET','/v2/orders', null, q);
     const arr = Array.isArray(oo?.result) ? oo.result
               : Array.isArray(oo?.orders) ? oo.orders
               : Array.isArray(oo) ? oo : [];
+
+    console.log('listOpenOrdersAllPages', { page, got: arr.length });
+
+    if (!arr.length) break;     // ✅ stop ONLY when empty page
     all = all.concat(arr);
-    if (arr.length < 200) break;
     page++;
   }
   return all;

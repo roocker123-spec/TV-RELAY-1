@@ -3,22 +3,23 @@
 // FAST_ENTER mode: try entry quickly (don’t lose margin on higher TF)
 // and retry once if exchange rejects due to not-yet-flat state.
 //
-// ✅ FIXES INCLUDED:
-// - SIG_STATE keyed by (sig_id|product_symbol)
-// - PENDING_BATCH keyed by (sig_id|product_symbol)
-// - Queue per symbol
-// - BATCH payload top-level product_id/product_symbol + strict whitelist
-// - DEDUPE includes orders hash
+// ✅ FIX (your CAKE/IP issue):
+// - SIG_STATE is now keyed by (sig_id|product_symbol) instead of only sig_id
+// - PENDING_BATCH is now keyed by (sig_id|product_symbol)
+// - Queue is per symbol (so multi-symbol alerts don’t block each other)
 //
-// ✅ CANCEL FIX (old orders not cancelled):
-// - cancelOrdersBySymbol() first tries DELETE /v2/orders/all with {product_id} (fast, no pagination)
-// - if that fails, falls back to list+cancel
+// ✅ BATCH FIX:
+// - placeBatch() now sends Delta-compatible payload: {product_id, product_symbol, orders:[...]}
+//   (Delta batch requires top-level product_id/product_symbol)
+// - per-order strict whitelist to avoid Delta rejecting unknown keys
 //
-// ✅ LIST OPEN ORDERS FIX:
-// - listOpenOrdersAllPages() attempts cursor-based pagination if API returns meta.after
-// - otherwise uses page/per_page fallback
-// - stops only on empty page
-// - logs pages + counts so you can verify you’re seeing old orders
+// ✅ DEDUPE FIX:
+// - seenKey() now includes orders hash when present so duplicate BATCH alerts dedupe correctly
+//
+// ✅ NEXT-BAR BATCH CORRECTIONS (added):
+// - Allow BATCH_TPS to arrive on the next bar even if sig_id drifted or sig_id/seq missing,
+//   as long as we recently placed an entry for that symbol (LAST_ENTRY_SENT window).
+// - STRICT seq numeric enforcement is relaxed for BATCH_TPS only (so "sig_id but no seq" won't be dropped).
 
 require('dotenv').config();
 const express = require('express');
@@ -83,9 +84,7 @@ const API_KEY       = process.env.DELTA_API_KEY || '';
 const API_SECRET    = process.env.DELTA_API_SECRET || '';
 const BASE_URL      = (process.env.DELTA_BASE || process.env.DELTA_BASE_URL || 'https://api.india.delta.exchange').replace(/\/+$/,'');
 const WEBHOOK_TOKEN = process.env.WEBHOOK_TOKEN || ''; // optional header check
-
-// ✅ Cloud Run compatibility: default 8080 (Cloud Run sets PORT anyway)
-const PORT          = process.env.PORT || 8080;
+const PORT          = process.env.PORT || 3000;
 
 const AUTH_MODE     = (process.env.DELTA_AUTH || 'hmac').toLowerCase(); // 'hmac' | 'keyonly'
 const HDR_API_KEY   = process.env.DELTA_HDR_API_KEY || 'api-key';
@@ -109,8 +108,8 @@ const FAST_ENTER_RETRY_MS = nnum(process.env.FAST_ENTER_RETRY_MS, 8000);
 // ---------- STRICT sequence (default ON) ----------
 const STRICT_SEQUENCE = String(process.env.STRICT_SEQUENCE || 'true').toLowerCase() !== 'false';
 
-// ---------- optional debug ----------
-const DEBUG_ORDERS_PAGES = String(process.env.DEBUG_ORDERS_PAGES || 'false').toLowerCase() === 'true';
+// ✅ NEXT-BAR BATCH SAFETY WINDOW (default 120s)
+const BATCH_AFTER_ENTER_WINDOW_MS = nnum(process.env.BATCH_AFTER_ENTER_WINDOW_MS, 120_000);
 
 // ---------- idempotency (drops dupes ~60s) ----------
 const SEEN = new Map();              // key -> ts(ms)
@@ -415,13 +414,21 @@ async function placeBracket(m){
   return dcall('POST','/v2/orders/bracket', body);
 }
 
+/**
+ * ✅ FIXED placeBatch():
+ * - Delta batch create requires top-level product_id or product_symbol
+ * - Sends only allowed fields per order to avoid Delta rejecting unknown keys
+ * - Keeps: reduce_only, side flip, coins->lots
+ */
 async function placeBatch(m){
+  // Resolve symbol
   const psym =
     toProductSymbol(m.product_symbol || m.symbol) ||
     toProductSymbol(m?.orders?.[0]?.product_symbol);
 
   if (!psym) throw new Error('placeBatch: missing product_symbol/symbol');
 
+  // Resolve product_id (preferred)
   const pid =
     (Number.isFinite(+m.product_id) ? +m.product_id : null) ||
     (await getProductIdBySymbol(psym));
@@ -432,6 +439,7 @@ async function placeBatch(m){
     throw new Error('placeBatch: missing orders[]');
   }
 
+  // Lot multiplier for coins->lots conversion
   let lotMult = getCachedLotMult(psym);
   if (!lotMult) {
     const meta  = await getProductMeta(psym);
@@ -448,29 +456,40 @@ async function placeBatch(m){
     orders: m.orders.slice(0, 50).map((o, idx) => {
       const oo = { ...o };
 
+      // coins -> lots
       const coins = nnum(oo.size_coins ?? oo.coins, 0);
       if (coins > 0) oo.size = Math.max(1, Math.floor(coins / lotMult));
 
+      // If size looks like coins, convert
       if (!coins && nnum(oo.size,0) > lotMult &&
           Math.abs(nnum(oo.size,0) / lotMult - Math.round(nnum(oo.size,0) / lotMult)) < 1e-6) {
         oo.size = Math.max(1, Math.floor(nnum(oo.size,0) / lotMult));
       }
 
+      // Ensure TP exits are opposite of last entry side
       if (last && (!oo.side || String(oo.side).toLowerCase() === last)) {
         oo.side = oppositeSide(last);
       }
 
+      // Ensure reduce_only true
       if (typeof oo.reduce_only === 'undefined') oo.reduce_only = true;
+
+      // Default type
       if (!oo.order_type) oo.order_type = 'limit_order';
+
+      // Normalize limit_price
       if (!oo.limit_price && (oo.price || oo.lmt_price)) oo.limit_price = oo.price || oo.lmt_price;
 
+      // Normalize types
       oo.size = Math.max(1, parseInt(oo.size, 10) || 0);
       if (!oo.size) throw new Error(`placeBatch: bad size on order #${idx}`);
 
       if (typeof oo.limit_price !== 'undefined') oo.limit_price = String(oo.limit_price);
 
+      // Remove unsupported
       delete oo.time_in_force;
 
+      // Strict whitelist
       const allowed = [
         'limit_price',
         'size',
@@ -487,6 +506,7 @@ async function placeBatch(m){
         if (typeof oo[k] !== 'undefined') cleaned[k] = oo[k];
       }
 
+      // Final guards
       if (!cleaned.limit_price) throw new Error(`placeBatch: missing limit_price on order #${idx}`);
       if (!cleaned.side) throw new Error(`placeBatch: missing side on order #${idx}`);
       if (!cleaned.order_type) cleaned.order_type = 'limit_order';
@@ -502,7 +522,7 @@ async function placeBatch(m){
 const cancelAllOrders   = () => dcall('DELETE','/v2/orders/all');
 const closeAllPositions = () => dcall('POST','/v2/positions/close_all', {});
 
-// Correct cancel endpoint is DELETE /v2/orders with body {id, product_id}
+// ✅ FIX: Correct cancel endpoint is DELETE /v2/orders with body {id, product_id}
 async function cancelOrder({ id, client_order_id, product_id, product_symbol }){
   const payload = {};
 
@@ -522,26 +542,10 @@ async function cancelOrder({ id, client_order_id, product_id, product_symbol }){
   return dcall('DELETE', '/v2/orders', payload);
 }
 
-// ✅ Strong cancel by symbol: try cancel-all-for-product first, then fallback to list+cancel
 async function cancelOrdersBySymbol(psym, { fallbackAll=false } = {}){
   const sym = toProductSymbol(psym);
   if (!sym) return { ok:true, skipped:true, reason:'missing_symbol' };
 
-  const pid = await getProductIdBySymbol(sym);
-  if (!pid) return { ok:true, skipped:true, reason:'could_not_resolve_product_id', symbol: sym };
-
-  // 1) Best: cancel all orders for this product_id (avoids pagination problems)
-  try {
-    await dcall('DELETE','/v2/orders/all', { product_id: pid });
-    console.log('cancelOrdersBySymbol: cancelled all for product', { sym, pid });
-    return { ok:true, cancelled:'all_for_product', symbol:sym, product_id: pid };
-  } catch (e) {
-    console.warn('cancelOrdersBySymbol: product cancel failed, fallback to list+cancel', {
-      sym, pid, err: String(e?.message || e)
-    });
-  }
-
-  // 2) Fallback: list all open orders then cancel those matching symbol
   let open = [];
   try { open = await listOpenOrdersAllPages(); }
   catch(e) {
@@ -550,22 +554,20 @@ async function cancelOrdersBySymbol(psym, { fallbackAll=false } = {}){
   }
 
   const mine = open.filter(o => safeUpper(o?.product_symbol||o?.symbol) === safeUpper(sym));
-  console.log('cancelOrdersBySymbol', { sym, pid, openCount: open.length, mineCount: mine.length });
-
   if (!mine.length) return { ok:true, skipped:true, reason:'no_open_orders_for_symbol', symbol: sym };
 
   let cancelled = 0, failed = 0;
   for (const o of mine){
     const oid = o?.id ?? o?.order_id;
-    const opid = o?.product_id ?? pid;
+    const pid = o?.product_id;
     const coid = o?.client_order_id;
 
     try {
-      await cancelOrder({ id: oid, client_order_id: coid, product_id: opid, product_symbol: sym });
+      await cancelOrder({ id: oid, client_order_id: coid, product_id: pid, product_symbol: sym });
       cancelled++;
     } catch(e){
       failed++;
-      console.warn('cancelOrdersBySymbol: cancel failed', { symbol: sym, oid, product_id: opid, err: e?.message || e });
+      console.warn('cancelOrdersBySymbol: cancel failed', { symbol: sym, oid, pid, err: e?.message || e });
     }
   }
 
@@ -577,76 +579,18 @@ async function cancelOrdersBySymbol(psym, { fallbackAll=false } = {}){
   return { ok:true, cancelled, failed, symbol: sym };
 }
 
-// ✅ Robust open orders pagination: tries cursor pagination, then falls back to page/per_page
 async function listOpenOrdersAllPages(){
-  const pageSize = 50;   // safe size
-  const maxPages = 60;   // safety guard
-
-  // ---- attempt 1: cursor pagination (if API returns meta.after) ----
-  try {
-    let all = [];
-    let after = null;
-
-    for (let i = 1; i <= maxPages; i++){
-      // use both "state" and "states" to be tolerant
-      const q = after
-        ? `?state=open,pending&states=open,pending&after=${encodeURIComponent(after)}&page_size=${pageSize}`
-        : `?state=open,pending&states=open,pending&page_size=${pageSize}`;
-
-      const oo = await dcall('GET','/v2/orders', null, q);
-
-      const arr = Array.isArray(oo?.result) ? oo.result
-                : Array.isArray(oo?.orders) ? oo.orders
-                : Array.isArray(oo) ? oo : [];
-
-      const metaAfter = oo?.meta?.after || oo?.result?.meta?.after || null;
-
-      console.log('listOpenOrders(cursor)', { iter: i, got: arr.length, hasAfter: !!metaAfter });
-
-      if (DEBUG_ORDERS_PAGES) {
-        console.log('cursor sample ids', i, arr.slice(0,3).map(o => o?.id ?? o?.order_id));
-      }
-
-      if (!arr.length) return all;        // empty page => done
-      all = all.concat(arr);
-
-      if (!metaAfter) {
-        // if there is no cursor returned, break and fall back to page method
-        break;
-      }
-
-      // if cursor repeats, stop to avoid infinite loop
-      if (metaAfter === after) return all;
-
-      after = metaAfter;
-    }
-
-    // If cursor path returned something and API didn’t give after, still return what we have.
-    // But if it always returned the same set, page fallback will catch it.
-    if (all.length) return all;
-
-  } catch (e) {
-    console.warn('listOpenOrders(cursor) failed, falling back to page/per_page', String(e?.message || e));
-  }
-
-  // ---- attempt 2: page/per_page fallback ----
   let all = [];
-  for (let page = 1; page <= maxPages; page++){
-    const q = `?state=open,pending&states=open,pending&page=${page}&per_page=${pageSize}&page_size=${pageSize}`;
+  let page = 1;
+  while (true){
+    const q = `?states=open,pending&page=${page}&per_page=200`;
     const oo = await dcall('GET','/v2/orders', null, q);
-
     const arr = Array.isArray(oo?.result) ? oo.result
               : Array.isArray(oo?.orders) ? oo.orders
               : Array.isArray(oo) ? oo : [];
-
-    console.log('listOpenOrders(page)', { page, got: arr.length });
-
-    if (DEBUG_ORDERS_PAGES) {
-      console.log('page sample ids', page, arr.slice(0,3).map(o => o?.id ?? o?.order_id));
-    }
-
-    if (!arr.length) break;
     all = all.concat(arr);
+    if (arr.length < 200) break;
+    page++;
   }
   return all;
 }
@@ -867,7 +811,7 @@ app.post('/tv', async (req, res) => {
     console.log(JSON.stringify({ action, sigId, seq, symTV, psym, ts: new Date().toISOString() }));
     console.log(JSON.stringify(msg));
 
-    // per-symbol queue (GLOBAL only for ALL-scope)
+    // ✅ per-symbol queue (GLOBAL only for ALL-scope)
     const qKey = isScopeAll(msg) ? 'GLOBAL' : `SYM:${safeUpper(psym)}`;
 
     const out = await enqueue(qKey, async () => {
@@ -878,12 +822,17 @@ app.post('/tv', async (req, res) => {
 
       if (action === 'EXIT') return { ok:true, ignored:'EXIT' };
 
+      // STRICT: if sig_id is present, seq must be numeric
+      // ✅ but relax this for BATCH_TPS (next-bar alerts sometimes omit seq)
       if (STRICT_SEQUENCE && sigId) {
-        if (!Number.isFinite(seq)) {
+        const allowMissingSeq = (action === 'BATCH_TPS');
+        if (!Number.isFinite(seq) && !allowMissingSeq) {
           return { ok:true, ignored:'missing_or_invalid_seq_in_strict_mode', sig_id: sigId, action };
         }
       }
 
+      // ✅ out-of-order guard PER (sig_id|symbol)
+      // (only applies when seq is numeric)
       if (STRICT_SEQUENCE && sigId && Number.isFinite(seq)) {
         const st = getSigState(sigId, psym);
         if (st && Number.isFinite(st.lastSeq) && st.lastSeq >= seq) {
@@ -932,11 +881,23 @@ app.post('/tv', async (req, res) => {
         if (Number.isFinite(seq) && seq !== 2) return { ok:true, ignored:'batch_seq_mismatch', expected:2, got: msg.seq };
 
         if (STRICT_SEQUENCE) {
-          if (!sigId) return { ok:true, ignored:'BATCH_TPS_missing_sig_id' };
-          const st = getSigState(sigId, psym);
-          if (!st || st.lastSeq < 1) {
-            queuePendingBatch(sigId, psym, msg);
-            return { ok:true, queued:'BATCH_TPS_waiting_for_ENTER', sig_id: sigId, symbol: psym, have: st ? st.lastSeq : null };
+          // ✅ Next-bar tolerance: allow batch if we recently placed entry for this symbol
+          const lastEnt = LAST_ENTRY_SENT.get(psym);
+          const recentEnter = !!(lastEnt && (Date.now() - lastEnt.ts) <= BATCH_AFTER_ENTER_WINDOW_MS);
+
+          // If no sig_id, we can only proceed on recent-enter (otherwise ignore)
+          if (!sigId) {
+            if (!recentEnter) {
+              return { ok:true, ignored:'BATCH_TPS_missing_sig_id_no_recent_enter', symbol: psym };
+            }
+            // proceed best-effort
+          } else {
+            const st = getSigState(sigId, psym);
+            if ((!st || st.lastSeq < 1) && !recentEnter) {
+              queuePendingBatch(sigId, psym, msg);
+              return { ok:true, queued:'BATCH_TPS_waiting_for_ENTER', sig_id: sigId, symbol: psym, have: st ? st.lastSeq : null };
+            }
+            // else proceed (either proper state OR recent-enter fallback)
           }
         }
 
@@ -1072,7 +1033,6 @@ app.post('/tv', async (req, res) => {
   }
 });
 
-// ✅ Cloud Run compatibility: bind to 0.0.0.0
-app.listen(PORT, "0.0.0.0", ()=>console.log(
-  `Relay listening on ${PORT} (BASE=${BASE_URL}, AUTH=${AUTH_MODE}, STRICT_SEQUENCE=${STRICT_SEQUENCE}, FAST_ENTER=${FAST_ENTER}, DEBUG_ORDERS_PAGES=${DEBUG_ORDERS_PAGES})`
+app.listen(PORT, ()=>console.log(
+  `Relay listening http://localhost:${PORT} (BASE=${BASE_URL}, AUTH=${AUTH_MODE}, STRICT_SEQUENCE=${STRICT_SEQUENCE}, FAST_ENTER=${FAST_ENTER})`
 ));

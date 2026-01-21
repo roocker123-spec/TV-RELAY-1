@@ -1,25 +1,16 @@
 // server.js (FULL) — PER-SYMBOL queue/lock, sig_id+seq idempotency,
-// STRICT sequencing: expects CANCAL(seq0) -> ENTER(seq1) -> BATCH_TPS(seq2),
-// FAST_ENTER mode: try entry quickly (don’t lose margin on higher TF)
-// and retry once if exchange rejects due to not-yet-flat state.
+// STRICT sequencing: expects CANCAL(seq0) -> ENTER(seq1) -> BATCH_TPS(seq2)
 //
-// ✅ FIX (your CAKE/IP issue):
-// - SIG_STATE is now keyed by (sig_id|product_symbol) instead of only sig_id
-// - PENDING_BATCH is now keyed by (sig_id|product_symbol)
-// - Queue is per symbol (so multi-symbol alerts don’t block each other)
+// ✅ CHANGE FOR YOUR REQUIREMENT:
+// - Removed "next-bar batch tolerance" (no missing sig_id/seq for batch, no recent-enter fallback).
+// - Enforced strict order and an optional time window (SIGNAL_CHAIN_WINDOW_MS) so
+//   cancel/enter/batch must happen close together (i.e., "same signal bar burst").
 //
-// ✅ BATCH FIX:
-// - placeBatch() now sends Delta-compatible payload: {product_id, product_symbol, orders:[...]}
-//   (Delta batch requires top-level product_id/product_symbol)
-// - per-order strict whitelist to avoid Delta rejecting unknown keys
+// Notes:
+// - TradingView still sends 3 separate HTTP requests. This server enforces that they must
+//   arrive in order and within SIGNAL_CHAIN_WINDOW_MS.
 //
-// ✅ DEDUPE FIX:
-// - seenKey() now includes orders hash when present so duplicate BATCH alerts dedupe correctly
-//
-// ✅ NEXT-BAR BATCH CORRECTIONS (added):
-// - Allow BATCH_TPS to arrive on the next bar even if sig_id drifted or sig_id/seq missing,
-//   as long as we recently placed an entry for that symbol (LAST_ENTRY_SENT window).
-// - STRICT seq numeric enforcement is relaxed for BATCH_TPS only (so "sig_id but no seq" won't be dropped).
+// Keep FAST_ENTER as-is (optional) for margin-speed, but sequencing remains strict.
 
 require('dotenv').config();
 const express = require('express');
@@ -108,8 +99,9 @@ const FAST_ENTER_RETRY_MS = nnum(process.env.FAST_ENTER_RETRY_MS, 8000);
 // ---------- STRICT sequence (default ON) ----------
 const STRICT_SEQUENCE = String(process.env.STRICT_SEQUENCE || 'true').toLowerCase() !== 'false';
 
-// ✅ NEXT-BAR BATCH SAFETY WINDOW (default 120s)
-const BATCH_AFTER_ENTER_WINDOW_MS = nnum(process.env.BATCH_AFTER_ENTER_WINDOW_MS, 120_000);
+// ✅ chain window to ensure "same bar burst" (default 15s)
+// If your webhooks take longer, raise this (e.g., 30000).
+const SIGNAL_CHAIN_WINDOW_MS = nnum(process.env.SIGNAL_CHAIN_WINDOW_MS, 15_000);
 
 // ---------- idempotency (drops dupes ~60s) ----------
 const SEEN = new Map();              // key -> ts(ms)
@@ -177,7 +169,7 @@ function setSigState(sig_id, psym, patch){
   SIG_STATE.set(k, { ...prev, ...patch, ts: Date.now() });
 }
 
-// ✅ Pending BATCH buffer (sig_id|symbol -> queued batch msg)
+// Pending BATCH buffer (sig_id|symbol -> queued batch msg)
 const PENDING_BATCH = new Map(); // key -> { msg, ts }
 const PENDING_TTL_MS = 60_000;
 
@@ -415,7 +407,7 @@ async function placeBracket(m){
 }
 
 /**
- * ✅ FIXED placeBatch():
+ * ✅ placeBatch():
  * - Delta batch create requires top-level product_id or product_symbol
  * - Sends only allowed fields per order to avoid Delta rejecting unknown keys
  * - Keeps: reduce_only, side flip, coins->lots
@@ -811,7 +803,7 @@ app.post('/tv', async (req, res) => {
     console.log(JSON.stringify({ action, sigId, seq, symTV, psym, ts: new Date().toISOString() }));
     console.log(JSON.stringify(msg));
 
-    // ✅ per-symbol queue (GLOBAL only for ALL-scope)
+    // per-symbol queue (GLOBAL only for ALL-scope)
     const qKey = isScopeAll(msg) ? 'GLOBAL' : `SYM:${safeUpper(psym)}`;
 
     const out = await enqueue(qKey, async () => {
@@ -822,17 +814,13 @@ app.post('/tv', async (req, res) => {
 
       if (action === 'EXIT') return { ok:true, ignored:'EXIT' };
 
-      // STRICT: if sig_id is present, seq must be numeric
-      // ✅ but relax this for BATCH_TPS (next-bar alerts sometimes omit seq)
-      if (STRICT_SEQUENCE && sigId) {
-        const allowMissingSeq = (action === 'BATCH_TPS');
-        if (!Number.isFinite(seq) && !allowMissingSeq) {
-          return { ok:true, ignored:'missing_or_invalid_seq_in_strict_mode', sig_id: sigId, action };
-        }
+      // STRICT: sig_id required and seq must be numeric for ALL actions (including BATCH)
+      if (STRICT_SEQUENCE) {
+        if (!sigId) return { ok:true, ignored:'missing_sig_id_in_strict_mode', action, symbol: psym };
+        if (!Number.isFinite(seq)) return { ok:true, ignored:'missing_or_invalid_seq_in_strict_mode', sig_id: sigId, action, symbol: psym };
       }
 
-      // ✅ out-of-order guard PER (sig_id|symbol)
-      // (only applies when seq is numeric)
+      // out-of-order guard PER (sig_id|symbol) (only applies when seq is numeric)
       if (STRICT_SEQUENCE && sigId && Number.isFinite(seq)) {
         const st = getSigState(sigId, psym);
         if (st && Number.isFinite(st.lastSeq) && st.lastSeq >= seq) {
@@ -850,7 +838,7 @@ app.post('/tv', async (req, res) => {
 
       // --------- CANCAL / CANCEL handler ---------
       if (action === 'CANCAL' || action === 'CANCEL') {
-        if (STRICT_SEQUENCE && sigId && Number.isFinite(seq) && seq !== 0) {
+        if (STRICT_SEQUENCE && seq !== 0) {
           return { ok:true, ignored:'CANCAL_seq_mismatch', expected:0, got: seq, sig_id: sigId, symbol: psym };
         }
 
@@ -864,7 +852,7 @@ app.post('/tv', async (req, res) => {
           flat = isScopeAll(msg) ? await waitUntilFlat() : await waitUntilFlatSymbol(psym);
         }
 
-        if (STRICT_SEQUENCE && sigId) setSigState(sigId, psym, { lastSeq: 0 });
+        if (STRICT_SEQUENCE) setSigState(sigId, psym, { lastSeq: 0 });
 
         return { ok:true, did:'CANCAL', steps, flat, symbol: psym };
       }
@@ -878,32 +866,27 @@ app.post('/tv', async (req, res) => {
       // Batch (TPs)
       if (msg.orders) {
         if (action !== 'BATCH_TPS') return { ok:true, ignored:'orders_without_BATCH_TPS' };
-        if (Number.isFinite(seq) && seq !== 2) return { ok:true, ignored:'batch_seq_mismatch', expected:2, got: msg.seq };
+        if (seq !== 2) return { ok:true, ignored:'batch_seq_mismatch', expected:2, got: msg.seq, sig_id: sigId, symbol: psym };
 
         if (STRICT_SEQUENCE) {
-          // ✅ Next-bar tolerance: allow batch if we recently placed entry for this symbol
-          const lastEnt = LAST_ENTRY_SENT.get(psym);
-          const recentEnter = !!(lastEnt && (Date.now() - lastEnt.ts) <= BATCH_AFTER_ENTER_WINDOW_MS);
+          const st = getSigState(sigId, psym);
 
-          // If no sig_id, we can only proceed on recent-enter (otherwise ignore)
-          if (!sigId) {
-            if (!recentEnter) {
-              return { ok:true, ignored:'BATCH_TPS_missing_sig_id_no_recent_enter', symbol: psym };
-            }
-            // proceed best-effort
-          } else {
-            const st = getSigState(sigId, psym);
-            if ((!st || st.lastSeq < 1) && !recentEnter) {
-              queuePendingBatch(sigId, psym, msg);
-              return { ok:true, queued:'BATCH_TPS_waiting_for_ENTER', sig_id: sigId, symbol: psym, have: st ? st.lastSeq : null };
-            }
-            // else proceed (either proper state OR recent-enter fallback)
+          // Must have seen ENTER (lastSeq >= 1)
+          if (!st || st.lastSeq < 1) {
+            queuePendingBatch(sigId, psym, msg);
+            return { ok:true, queued:'BATCH_TPS_waiting_for_ENTER', sig_id: sigId, symbol: psym, have: st ? st.lastSeq : null };
+          }
+
+          // Enforce "same burst" window from ENTER timestamp
+          // (ENTER setsSigState(..., {lastSeq:1}) with ts=Date.now()).
+          if ((Date.now() - st.ts) > SIGNAL_CHAIN_WINDOW_MS) {
+            return { ok:true, ignored:'BATCH_TPS_too_late_for_same_bar_window', sig_id: sigId, symbol: psym, window_ms: SIGNAL_CHAIN_WINDOW_MS };
           }
         }
 
         const r = await placeBatch(msg);
 
-        if (STRICT_SEQUENCE && sigId) setSigState(sigId, psym, { lastSeq: 2 });
+        if (STRICT_SEQUENCE) setSigState(sigId, psym, { lastSeq: 2 });
 
         return { ok:true, step:'batch', r, symbol: psym };
       }
@@ -912,14 +895,22 @@ app.post('/tv', async (req, res) => {
       if (action === 'ENTER' || action === 'FLIP') {
 
         if (STRICT_SEQUENCE) {
-          if (!sigId) return { ok:true, ignored:'ENTER_missing_sig_id' };
-          if (Number.isFinite(seq) && seq !== 1) return { ok:true, ignored:'ENTER_seq_mismatch', expected:1, got: msg.seq };
-        }
+          if (seq !== 1) return { ok:true, ignored:'ENTER_seq_mismatch', expected:1, got: msg.seq, sig_id: sigId, symbol: psym };
 
-        const st = (STRICT_SEQUENCE && sigId) ? (getSigState(sigId, psym) || { lastSeq: -1 }) : null;
+          const st = getSigState(sigId, psym);
 
-        if (STRICT_SEQUENCE && st && st.lastSeq >= 1) {
-          return { ok:true, ignored:'ENTER_already_seen', sig_id: sigId, symbol: psym, have: st.lastSeq };
+          // Must have seen CANCAL first (lastSeq === 0)
+          if (!st || st.lastSeq < 0) {
+            return { ok:true, ignored:'ENTER_before_CANCAL', sig_id: sigId, symbol: psym };
+          }
+          if (st.lastSeq !== 0) {
+            return { ok:true, ignored:'ENTER_not_expected_state', sig_id: sigId, symbol: psym, have: st.lastSeq };
+          }
+
+          // Enforce "same burst" window from CANCAL timestamp
+          if ((Date.now() - st.ts) > SIGNAL_CHAIN_WINDOW_MS) {
+            return { ok:true, ignored:'ENTER_too_late_after_CANCAL_for_same_bar_window', sig_id: sigId, symbol: psym, window_ms: SIGNAL_CHAIN_WINDOW_MS };
+          }
         }
 
         const requireFlat = (typeof msg.require_flat === 'undefined') ? true : !!msg.require_flat;
@@ -936,7 +927,7 @@ app.post('/tv', async (req, res) => {
 
         const steps = await flattenFromMsg(msg, psym);
 
-        // -------- FAST ENTER GATE --------
+        // FAST ENTER GATE
         if (requireFlat && FAST_ENTER) {
           const flatQuick = isScopeAll(msg)
             ? await waitUntilFlat(FAST_ENTER_WAIT_MS, FLAT_POLL_MS)
@@ -947,16 +938,20 @@ app.post('/tv', async (req, res) => {
           try {
             const r = await placeEntry(msg);
 
-            if (STRICT_SEQUENCE && sigId) setSigState(sigId, psym, { lastSeq: 1 });
+            if (STRICT_SEQUENCE) setSigState(sigId, psym, { lastSeq: 1 });
 
             let batch = null, batch_error = null;
-            const pendingMsg = STRICT_SEQUENCE && sigId ? takePendingBatch(sigId, psym) : null;
+            const pendingMsg = STRICT_SEQUENCE ? takePendingBatch(sigId, psym) : null;
             if (pendingMsg) {
-              try {
-                batch = await placeBatch(pendingMsg);
-                if (STRICT_SEQUENCE && sigId) setSigState(sigId, psym, { lastSeq: 2 });
-              } catch (e) {
-                batch_error = String(e?.message || e);
+              // If batch was queued, only fire if still within same-burst window
+              const st2 = getSigState(sigId, psym);
+              if (!st2 || (Date.now() - st2.ts) > SIGNAL_CHAIN_WINDOW_MS) {
+                batch_error = 'pending_batch_expired_for_same_bar_window';
+              } else {
+                try {
+                  batch = await placeBatch(pendingMsg);
+                  if (STRICT_SEQUENCE) setSigState(sigId, psym, { lastSeq: 2 });
+                } catch (e) { batch_error = String(e?.message || e); }
               }
             }
 
@@ -975,16 +970,19 @@ app.post('/tv', async (req, res) => {
 
             const r = await placeEntry(msg);
 
-            if (STRICT_SEQUENCE && sigId) setSigState(sigId, psym, { lastSeq: 1 });
+            if (STRICT_SEQUENCE) setSigState(sigId, psym, { lastSeq: 1 });
 
             let batch = null, batch_error = null;
-            const pendingMsg = STRICT_SEQUENCE && sigId ? takePendingBatch(sigId, psym) : null;
+            const pendingMsg = STRICT_SEQUENCE ? takePendingBatch(sigId, psym) : null;
             if (pendingMsg) {
-              try {
-                batch = await placeBatch(pendingMsg);
-                if (STRICT_SEQUENCE && sigId) setSigState(sigId, psym, { lastSeq: 2 });
-              } catch (err) {
-                batch_error = String(err?.message || err);
+              const st2 = getSigState(sigId, psym);
+              if (!st2 || (Date.now() - st2.ts) > SIGNAL_CHAIN_WINDOW_MS) {
+                batch_error = 'pending_batch_expired_for_same_bar_window';
+              } else {
+                try {
+                  batch = await placeBatch(pendingMsg);
+                  if (STRICT_SEQUENCE) setSigState(sigId, psym, { lastSeq: 2 });
+                } catch (err) { batch_error = String(err?.message || err); }
               }
             }
 
@@ -992,7 +990,7 @@ app.post('/tv', async (req, res) => {
           }
         }
 
-        // -------- Original strict wait (if FAST_ENTER off) --------
+        // Original strict wait (if FAST_ENTER off)
         if (requireFlat && !FAST_ENTER) {
           const flat = isScopeAll(msg) ? await waitUntilFlat() : await waitUntilFlatSymbol(psym);
           console.log('flat gate result:', { symbol: psym, flat });
@@ -1001,16 +999,19 @@ app.post('/tv', async (req, res) => {
 
         const r = await placeEntry(msg);
 
-        if (STRICT_SEQUENCE && sigId) setSigState(sigId, psym, { lastSeq: 1 });
+        if (STRICT_SEQUENCE) setSigState(sigId, psym, { lastSeq: 1 });
 
         let batch = null, batch_error = null;
-        const pendingMsg = STRICT_SEQUENCE && sigId ? takePendingBatch(sigId, psym) : null;
+        const pendingMsg = STRICT_SEQUENCE ? takePendingBatch(sigId, psym) : null;
         if (pendingMsg) {
-          try {
-            batch = await placeBatch(pendingMsg);
-            if (STRICT_SEQUENCE && sigId) setSigState(sigId, psym, { lastSeq: 2 });
-          } catch (e) {
-            batch_error = String(e?.message || e);
+          const st2 = getSigState(sigId, psym);
+          if (!st2 || (Date.now() - st2.ts) > SIGNAL_CHAIN_WINDOW_MS) {
+            batch_error = 'pending_batch_expired_for_same_bar_window';
+          } else {
+            try {
+              batch = await placeBatch(pendingMsg);
+              if (STRICT_SEQUENCE) setSigState(sigId, psym, { lastSeq: 2 });
+            } catch (e) { batch_error = String(e?.message || e); }
           }
         }
 
@@ -1034,5 +1035,5 @@ app.post('/tv', async (req, res) => {
 });
 
 app.listen(PORT, ()=>console.log(
-  `Relay listening http://localhost:${PORT} (BASE=${BASE_URL}, AUTH=${AUTH_MODE}, STRICT_SEQUENCE=${STRICT_SEQUENCE}, FAST_ENTER=${FAST_ENTER})`
+  `Relay listening http://localhost:${PORT} (BASE=${BASE_URL}, AUTH=${AUTH_MODE}, STRICT_SEQUENCE=${STRICT_SEQUENCE}, FAST_ENTER=${FAST_ENTER}, SIGNAL_CHAIN_WINDOW_MS=${SIGNAL_CHAIN_WINDOW_MS})`
 ));

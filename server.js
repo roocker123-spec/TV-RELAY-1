@@ -1,11 +1,18 @@
 // server.js (FULL) — PER-SYMBOL queue/lock, sig_id+seq idempotency,
 // STRICT sequencing: expects CANCAL(seq0) -> ENTER(seq1) -> BATCH_TPS(seq2)
 //
-// ✅ THIS VERSION FIXES YOUR 2 ISSUES:
-// 1) Out-of-order arrival (ENTER/BATCH before CANCAL) no longer “returns early”.
-//    Every webhook tries to progress the chain as far as possible: cancel -> enter -> batch.
-// 2) Position not closing: fixes units mismatch (Delta positions often report size in LOTS/contracts,
-//    but your old code treated it like “coins” and divided by lotMult, so it never fully closed).
+// ✅ THIS VERSION ENFORCES TRUE ORDER:
+// - CANCAL is the ONLY step that cancels orders / closes positions.
+// - ENTER will NOT cancel/close; it only waits for flat (if require_flat) then enters.
+// - BATCH_TPS only places TP batch.
+//
+// ✅ FIXES INCLUDED:
+// 1) Chain draining: if messages arrive out-of-order, every request tries to progress
+//    cancel -> enter -> batch using buffered msgs.
+// 2) Position closing fix: Delta position size often is LOTS/contracts (e.g., -4 IP).
+//    We detect that and close using lots directly.
+//
+// ⚠️ Cloud Run: Use Max instances = 1 (and ideally concurrency = 1) OR store state in Redis/Firestore.
 
 require('dotenv').config();
 const express = require('express');
@@ -98,8 +105,13 @@ const STRICT_SEQUENCE = String(process.env.STRICT_SEQUENCE || 'true').toLowerCas
 // ✅ chain window to ensure "same bar burst" (default 15s)
 const SIGNAL_CHAIN_WINDOW_MS = nnum(process.env.SIGNAL_CHAIN_WINDOW_MS, 15_000);
 
-// ✅ Optional auto-repair: if ENTER arrives without CANCAL, synthesize cancel
+// ✅ IMPORTANT: for YOUR desired behavior keep this FALSE
+// If true, ENTER could synthesize cancel (not what you want)
 const AUTO_CANCEL_ON_ENTER = String(process.env.AUTO_CANCEL_ON_ENTER || 'false').toLowerCase() === 'true';
+
+// ✅ Force behavior for CANCAL step defaults
+const FORCE_CANCEL_ORDERS_ON_CANCEL = String(process.env.FORCE_CANCEL_ORDERS_ON_CANCEL || 'true').toLowerCase() !== 'false';
+const FORCE_CLOSE_ON_CANCEL         = String(process.env.FORCE_CLOSE_ON_CANCEL || 'true').toLowerCase() !== 'false';
 
 // ---------- idempotency (drops dupes ~60s) ----------
 const SEEN = new Map();              // key -> ts(ms)
@@ -150,7 +162,7 @@ function setSigState(sig_id, psym, patch){
   SIG_STATE.set(k, { ...prev, ...patch, ts: Date.now() });
 }
 
-// -------------------- CHAIN BUFFER (repairs out-of-order seq arrivals) --------------------
+// -------------------- CHAIN BUFFER --------------------
 const CHAIN = new Map(); // key(sig_id|symbol) -> { createdAt, cancelMsg, enterMsg, batchMsg, didCancel, didEnter, didBatch, lastTouch }
 const CHAIN_TTL_MS = 2 * 60 * 1000;
 
@@ -192,7 +204,7 @@ function upsertChainMsg(sigId, psym, seq, msg){
   return c;
 }
 
-// ---------- Delta request helper (retries/backoff) ----------
+// ---------- Delta request helper ----------
 async function dcall(method, path, payload=null, query='') {
   const body = payload ? JSON.stringify(payload) : '';
   const MAX_TRIES = 3;
@@ -237,7 +249,7 @@ async function dcall(method, path, payload=null, query='') {
   }
 }
 
-// ---------- product + price helpers ----------
+// ---------- product helpers ----------
 let _products = null, _products_ts = 0;
 async function getProducts(){
   const STALE_MS = 5*60*1000;
@@ -263,11 +275,6 @@ async function getProductIdBySymbol(psym){
 }
 
 const LOT_MULT_CACHE = new Map(); // product_symbol -> { m, ts }
-app.get('/debug/lotcache', (_req,res)=>{
-  const o = {}; for (const [k,v] of LOT_MULT_CACHE) o[k]=v;
-  res.json(o);
-});
-
 function lotMultiplierFromMeta(meta){
   const cand = [
     meta?.contract_value,
@@ -279,7 +286,6 @@ function lotMultiplierFromMeta(meta){
 
   const ints = cand.filter(n => Math.abs(n - Math.round(n)) < 1e-6);
   let m = (ints.length ? Math.max(...ints) : (cand.length ? Math.max(...cand) : 1));
-
   if (!Number.isFinite(m) || m < 1) m = 1;
   return Math.round(m);
 }
@@ -393,17 +399,10 @@ async function placeEntry(m){
 
   rememberSide(product_symbol, side);
   LAST_ENTRY_SENT.set(product_symbol, { lots: sizeLots, ts: Date.now(), side });
-
   learnLotMultFromPositions(product_symbol).catch(()=>{});
   return out;
 }
 
-/**
- * ✅ placeBatch():
- * - Delta batch create requires top-level product_id or product_symbol
- * - Sends only allowed fields per order to avoid Delta rejecting unknown keys
- * - Keeps: reduce_only, side flip, coins->lots
- */
 async function placeBatch(m){
   const psym =
     toProductSymbol(m.product_symbol || m.symbol) ||
@@ -460,20 +459,11 @@ async function placeBatch(m){
       delete oo.time_in_force;
 
       const allowed = [
-        'limit_price',
-        'size',
-        'side',
-        'order_type',
-        'reduce_only',
-        'post_only',
-        'mmp',
-        'client_order_id'
+        'limit_price','size','side','order_type','reduce_only','post_only','mmp','client_order_id'
       ];
 
       const cleaned = {};
-      for (const k of allowed) {
-        if (typeof oo[k] !== 'undefined') cleaned[k] = oo[k];
-      }
+      for (const k of allowed) if (typeof oo[k] !== 'undefined') cleaned[k] = oo[k];
 
       if (!cleaned.limit_price) throw new Error(`placeBatch: missing limit_price on order #${idx}`);
       if (!cleaned.side) throw new Error(`placeBatch: missing side on order #${idx}`);
@@ -490,7 +480,7 @@ async function placeBatch(m){
 const cancelAllOrders   = () => dcall('DELETE','/v2/orders/all');
 const closeAllPositions = () => dcall('POST','/v2/positions/close_all', {});
 
-// ✅ FIX: Correct cancel endpoint is DELETE /v2/orders with body {id, product_id}
+// ✅ Correct cancel endpoint is DELETE /v2/orders with body {id, product_id}
 async function cancelOrder({ id, client_order_id, product_id, product_symbol }){
   const payload = {};
 
@@ -508,6 +498,22 @@ async function cancelOrder({ id, client_order_id, product_id, product_symbol }){
   }
 
   return dcall('DELETE', '/v2/orders', payload);
+}
+
+async function listOpenOrdersAllPages(){
+  let all = [];
+  let page = 1;
+  while (true){
+    const q = `?states=open,pending&page=${page}&per_page=200`;
+    const oo = await dcall('GET','/v2/orders', null, q);
+    const arr = Array.isArray(oo?.result) ? oo.result
+              : Array.isArray(oo?.orders) ? oo.orders
+              : Array.isArray(oo) ? oo : [];
+    all = all.concat(arr);
+    if (arr.length < 200) break;
+    page++;
+  }
+  return all;
 }
 
 async function cancelOrdersBySymbol(psym, { fallbackAll=false } = {}){
@@ -547,22 +553,6 @@ async function cancelOrdersBySymbol(psym, { fallbackAll=false } = {}){
   return { ok:true, cancelled, failed, symbol: sym };
 }
 
-async function listOpenOrdersAllPages(){
-  let all = [];
-  let page = 1;
-  while (true){
-    const q = `?states=open,pending&page=${page}&per_page=200`;
-    const oo = await dcall('GET','/v2/orders', null, q);
-    const arr = Array.isArray(oo?.result) ? oo.result
-              : Array.isArray(oo?.orders) ? oo.orders
-              : Array.isArray(oo) ? oo : [];
-    all = all.concat(arr);
-    if (arr.length < 200) break;
-    page++;
-  }
-  return all;
-}
-
 async function listPositionsArray(){
   try {
     const pos = await dcall('GET','/v2/positions');
@@ -583,7 +573,7 @@ async function listPositionsArray(){
   return [];
 }
 
-// ✅ FIXED: close position correctly even if Delta returns size in LOTS/contracts
+// ✅ close position correctly even if Delta returns size in LOTS/contracts
 async function closePositionBySymbol(symbolOrProductSymbol){
   const psym = toProductSymbol(symbolOrProductSymbol);
   if (!psym) throw new Error('closePositionBySymbol: missing symbol/product_symbol');
@@ -592,13 +582,11 @@ async function closePositionBySymbol(symbolOrProductSymbol){
   const row = pos.find(p => safeUpper(p?.product_symbol || p?.symbol) === safeUpper(psym));
 
   const rawSize = Number(row?.size || row?.position_size || 0);
-
   if (!rawSize || Math.abs(rawSize) < 1e-12) {
     console.log('closePositionBySymbol: no open position for', psym);
     return { ok:true, skipped:true, reason:'no_position' };
   }
 
-  // If size looks like lots/contracts (small, near-integer), treat it as lots directly
   const looksLikeLots =
     Number.isFinite(rawSize) &&
     Math.abs(rawSize) <= MAX_LOTS_PER_ORDER &&
@@ -619,7 +607,6 @@ async function closePositionBySymbol(symbolOrProductSymbol){
   }
 
   const side = rawSize > 0 ? 'sell' : 'buy';
-
   console.log('closePositionBySymbol:', { psym, rawSize, looksLikeLots, lots, side });
 
   return dcall('POST','/v2/orders',{
@@ -694,17 +681,21 @@ async function isFlatNowSymbol(psym){
   } catch { return false; }
 }
 
-async function flattenFromMsg(msg, psym){
-  const scopeAll = isScopeAll(msg);
+async function flattenFromCancelMsg(cancelMsg, psym){
+  const scopeAll = isScopeAll(cancelMsg);
 
-  const doCancelOrders = (typeof msg.cancel_orders === 'undefined') ? true : !!msg.cancel_orders;
-  const doClosePos     = (typeof msg.close_position === 'undefined') ? true : !!msg.close_position;
+  // ✅ Force defaults on cancel step (unless explicitly set false)
+  if (FORCE_CANCEL_ORDERS_ON_CANCEL && typeof cancelMsg.cancel_orders === 'undefined') cancelMsg.cancel_orders = true;
+  if (FORCE_CLOSE_ON_CANCEL && typeof cancelMsg.close_position === 'undefined') cancelMsg.close_position = true;
+
+  const doCancelOrders = (typeof cancelMsg.cancel_orders === 'undefined') ? true : !!cancelMsg.cancel_orders;
+  const doClosePos     = (typeof cancelMsg.close_position === 'undefined') ? true : !!cancelMsg.close_position;
 
   const cancelScope = String(
-    msg.cancel_orders_scope || (scopeAll ? 'ALL' : 'SYMBOL')
+    cancelMsg.cancel_orders_scope || (scopeAll ? 'ALL' : 'SYMBOL')
   ).toUpperCase();
 
-  const cancelFallbackAll = !!msg.cancel_fallback_all;
+  const cancelFallbackAll = !!cancelMsg.cancel_fallback_all;
 
   const steps = {
     cancel_orders: false,
@@ -727,7 +718,7 @@ async function flattenFromMsg(msg, psym){
       steps.cancel_orders = true;
     } catch (e) {
       steps.cancel_error = String(e?.message || e);
-      console.warn('flatten cancel failed:', e?.message || e);
+      console.warn('cancel step: cancel failed:', e?.message || e);
     }
   }
 
@@ -737,7 +728,7 @@ async function flattenFromMsg(msg, psym){
         await closeAllPositions();
         steps.close_mode = 'close_all_positions';
       } else {
-        const sym = msg.symbol || msg.product_symbol || psym;
+        const sym = cancelMsg.symbol || cancelMsg.product_symbol || psym;
         if (sym) {
           await closePositionBySymbol(sym);
           steps.close_mode = 'close_by_symbol';
@@ -749,7 +740,7 @@ async function flattenFromMsg(msg, psym){
       steps.close_position = true;
     } catch (e) {
       steps.close_error = String(e?.message || e);
-      console.warn('flatten close failed:', e?.message || e);
+      console.warn('cancel step: close failed:', e?.message || e);
     }
   }
 
@@ -760,13 +751,6 @@ async function flattenFromMsg(msg, psym){
 app.get('/health', (_req,res)=>res.json({ok:true, started_at:process.env.__STARTED_AT}));
 app.get('/healthz', (_req,res)=>res.send('ok'));
 app.get('/debug/seen', (_req,res)=>{ res.json({ size: SEEN.size }); });
-
-app.get('/debug/sigstate', (_req,res)=>{
-  cleanupSigState();
-  const out = {};
-  for (const [k,v] of SIG_STATE) out[k] = v;
-  res.json(out);
-});
 
 app.get('/debug/chain', (_req,res)=>{
   cleanupChain();
@@ -803,7 +787,6 @@ app.post('/tv', async (req, res) => {
 
     console.log('\n=== INCOMING /tv ===');
     console.log(JSON.stringify({ action, sigId, seq, symTV, psym, ts: new Date().toISOString() }));
-    console.log(JSON.stringify(msg));
 
     const qKey = isScopeAll(msg) ? 'GLOBAL' : `SYM:${safeUpper(psym)}`;
 
@@ -825,145 +808,114 @@ app.post('/tv', async (req, res) => {
 
       console.log('instance:', { K_REVISION: process.env.K_REVISION, HOSTNAME: process.env.HOSTNAME });
 
+      // Buffer whatever arrived
       const chain = upsertChainMsg(sigId, psym, seq, msg);
 
+      // Enforce same burst window
       const ageMs = Date.now() - (chain?.createdAt || Date.now());
       if (ageMs > SIGNAL_CHAIN_WINDOW_MS) {
         return { ok:true, ignored:'chain_expired', sig_id: sigId, symbol: psym, age_ms: ageMs, window_ms: SIGNAL_CHAIN_WINDOW_MS };
       }
 
-      // helper: run cancel
-      const runCancel = async (cancelMsg) => {
-        if (!cancelMsg) return { ok:false, skipped:true, reason:'no_cancel_payload' };
-        if (typeof cancelMsg.cancel_orders_scope === 'undefined') cancelMsg.cancel_orders_scope = 'SYMBOL';
+      const progressed = [];
 
-        const steps = await flattenFromMsg(cancelMsg, psym);
+      // ---------------- STEP 1: CANCAL ----------------
+      if (!chain.didCancel) {
+        if (chain.cancelMsg) {
+          const cancelMsg = chain.cancelMsg;
+          if (typeof cancelMsg.cancel_orders_scope === 'undefined') cancelMsg.cancel_orders_scope = 'SYMBOL';
 
-        const requireFlat = (typeof cancelMsg.require_flat === 'undefined') ? true : !!cancelMsg.require_flat;
-        let flat = true;
-        if (requireFlat) {
-          flat = isScopeAll(cancelMsg) ? await waitUntilFlat() : await waitUntilFlatSymbol(psym);
+          const steps = await flattenFromCancelMsg(cancelMsg, psym);
+
+          const requireFlat = (typeof cancelMsg.require_flat === 'undefined') ? true : !!cancelMsg.require_flat;
+          let flat = true;
+          if (requireFlat) {
+            flat = isScopeAll(cancelMsg) ? await waitUntilFlat() : await waitUntilFlatSymbol(psym);
+          }
+
+          chain.didCancel = true;
+          if (STRICT_SEQUENCE) setSigState(sigId, psym, { lastSeq: 0 });
+
+          progressed.push({ ok:true, did:'CANCAL', steps, flat, symbol: psym });
+        } else {
+          // If you accidentally enabled AUTO_CANCEL_ON_ENTER it can break your desired order
+          if (AUTO_CANCEL_ON_ENTER && chain.enterMsg) {
+            const syntheticCancel = { ...chain.enterMsg, action:'CANCAL', seq:0, cancel_orders_scope:'SYMBOL' };
+            const steps = await flattenFromCancelMsg(syntheticCancel, psym);
+            const flat = isScopeAll(syntheticCancel) ? await waitUntilFlat() : await waitUntilFlatSymbol(psym);
+
+            chain.didCancel = true;
+            if (STRICT_SEQUENCE) setSigState(sigId, psym, { lastSeq: 0 });
+            progressed.push({ ok:true, did:'CANCAL', synthetic:true, steps, flat, symbol: psym });
+          } else {
+            return { ok:true, queued:'waiting_for_CANCAL', sig_id: sigId, symbol: psym, have:{ cancel:!!chain.cancelMsg, enter:!!chain.enterMsg, batch:!!chain.batchMsg }, did:{ cancel:chain.didCancel, enter:chain.didEnter, batch:chain.didBatch } };
+          }
+        }
+      }
+
+      // ---------------- STEP 2: ENTER ----------------
+      if (chain.didCancel && !chain.didEnter) {
+        if (!chain.enterMsg) {
+          return { ok:true, queued:'waiting_for_ENTER', sig_id: sigId, symbol: psym, have:{ cancel:!!chain.cancelMsg, enter:!!chain.enterMsg, batch:!!chain.batchMsg }, did:{ cancel:chain.didCancel, enter:chain.didEnter, batch:chain.didBatch } };
         }
 
-        if (STRICT_SEQUENCE) setSigState(sigId, psym, { lastSeq: 0 });
+        const enterMsg = chain.enterMsg;
 
-        return { ok:true, did:'CANCAL', steps, flat, symbol: psym };
-      };
-
-      // helper: run enter
-      const runEnter = async (enterMsg) => {
+        // ✅ ENTER DOES NOT CANCEL/CLOSE ANYTHING NOW
         const requireFlat = (typeof enterMsg.require_flat === 'undefined') ? true : !!enterMsg.require_flat;
-        if (typeof enterMsg.cancel_orders_scope === 'undefined') enterMsg.cancel_orders_scope = 'SYMBOL';
 
-        let flatNow = true;
         if (requireFlat) {
-          flatNow = isScopeAll(enterMsg) ? await isFlatNowGlobal() : await isFlatNowSymbol(psym);
-        }
+          // quick check
+          const flatNow = isScopeAll(enterMsg) ? await isFlatNowGlobal() : await isFlatNowSymbol(psym);
 
-        if (typeof enterMsg.cancel_orders === 'undefined') enterMsg.cancel_orders = requireFlat ? (!flatNow) : false;
-        if (typeof enterMsg.close_position === 'undefined') enterMsg.close_position = requireFlat ? (!flatNow) : false;
+          if (!flatNow) {
+            if (FAST_ENTER) {
+              const flatQuick = isScopeAll(enterMsg)
+                ? await waitUntilFlat(FAST_ENTER_WAIT_MS, FLAT_POLL_MS)
+                : await waitUntilFlatSymbol(psym, FAST_ENTER_WAIT_MS, FLAT_POLL_MS);
 
-        const steps = await flattenFromMsg(enterMsg, psym);
+              if (!flatQuick) {
+                const flatRetry = isScopeAll(enterMsg)
+                  ? await waitUntilFlat(FAST_ENTER_RETRY_MS, FLAT_POLL_MS)
+                  : await waitUntilFlatSymbol(psym, FAST_ENTER_RETRY_MS, FLAT_POLL_MS);
 
-        // FAST ENTER
-        if (requireFlat && FAST_ENTER) {
-          const flatQuick = isScopeAll(enterMsg)
-            ? await waitUntilFlat(FAST_ENTER_WAIT_MS, FLAT_POLL_MS)
-            : await waitUntilFlatSymbol(psym, FAST_ENTER_WAIT_MS, FLAT_POLL_MS);
-
-          console.log('FAST_ENTER quick-flat:', { symbol: psym, flatQuick, waitMs: FAST_ENTER_WAIT_MS });
-
-          try {
-            const r = await placeEntry(enterMsg);
-            if (STRICT_SEQUENCE) setSigState(sigId, psym, { lastSeq: 1 });
-            return { ok:true, step:'entry', fast_enter:true, flat_quick: flatQuick, steps, r, symbol: psym };
-
-          } catch (e) {
-            console.warn('FAST_ENTER first attempt failed:', e?.message || e);
-
-            const flatRetry = isScopeAll(enterMsg)
-              ? await waitUntilFlat(FAST_ENTER_RETRY_MS, FLAT_POLL_MS)
-              : await waitUntilFlatSymbol(psym, FAST_ENTER_RETRY_MS, FLAT_POLL_MS);
-
-            console.log('FAST_ENTER retry-flat:', { symbol: psym, flatRetry, retryMs: FAST_ENTER_RETRY_MS });
-
-            if (!flatRetry) return { ok:false, error:'require_flat_timeout_fast_retry', sig_id: sigId, symbol: psym, steps };
-
-            const r = await placeEntry(enterMsg);
-            if (STRICT_SEQUENCE) setSigState(sigId, psym, { lastSeq: 1 });
-            return { ok:true, step:'entry', fast_enter:true, flat_retry: flatRetry, steps, r, symbol: psym };
+                if (!flatRetry) {
+                  return { ok:false, error:'require_flat_timeout', sig_id: sigId, symbol: psym, stage:'ENTER', note:'Not flat after cancel. Entry blocked.' };
+                }
+              }
+            } else {
+              const flat = isScopeAll(enterMsg) ? await waitUntilFlat() : await waitUntilFlatSymbol(psym);
+              if (!flat) {
+                return { ok:false, error:'require_flat_timeout', sig_id: sigId, symbol: psym, stage:'ENTER', note:'Not flat after cancel. Entry blocked.' };
+              }
+            }
           }
         }
 
-        // normal strict wait
-        if (requireFlat && !FAST_ENTER) {
-          const flat = isScopeAll(enterMsg) ? await waitUntilFlat() : await waitUntilFlatSymbol(psym);
-          console.log('flat gate result:', { symbol: psym, flat });
-          if (!flat) return { ok:false, error:'require_flat_timeout', sig_id: sigId, symbol: psym, steps };
-        }
-
         const r = await placeEntry(enterMsg);
-        if (STRICT_SEQUENCE) setSigState(sigId, psym, { lastSeq: 1 });
-        return { ok:true, step:'entry', steps, r, symbol: psym };
-      };
-
-      // helper: run batch
-      const runBatch = async (batchMsg) => {
-        const r = await placeBatch(batchMsg);
-        if (STRICT_SEQUENCE) setSigState(sigId, psym, { lastSeq: 2 });
-        return { ok:true, step:'batch', r, symbol: psym };
-      };
-
-      // ✅ IMPORTANT CHANGE:
-      // Do NOT return early just because "this request was seq=0/1/2".
-      // Always try to progress: cancel -> enter -> batch in the same request.
-      const progressed = [];
-
-      // 1) CANCEL
-      if (!chain.didCancel) {
-        if (chain.cancelMsg) {
-          const cancelOut = await runCancel(chain.cancelMsg);
-          chain.didCancel = true;
-          progressed.push(cancelOut);
-        } else if (AUTO_CANCEL_ON_ENTER && chain.enterMsg) {
-          const syntheticCancel = { ...chain.enterMsg, action:'CANCAL', seq:0, cancel_orders_scope:'SYMBOL' };
-          const cancelOut = await runCancel(syntheticCancel);
-          chain.didCancel = true;
-          console.log('AUTO_CANCEL_ON_ENTER ran synthetic cancel', { sig_id: sigId, symbol: psym });
-          progressed.push({ ...cancelOut, synthetic:true });
-        }
-      }
-
-      // 2) ENTER
-      if (chain.didCancel && !chain.didEnter && chain.enterMsg) {
-        const enterOut = await runEnter(chain.enterMsg);
         chain.didEnter = true;
-        progressed.push(enterOut);
+        if (STRICT_SEQUENCE) setSigState(sigId, psym, { lastSeq: 1 });
+
+        progressed.push({ ok:true, step:'entry', r, symbol: psym });
       }
 
-      // 3) BATCH
-      if (chain.didCancel && chain.didEnter && !chain.didBatch && chain.batchMsg) {
-        const batchOut = await runBatch(chain.batchMsg);
+      // ---------------- STEP 3: BATCH_TPS ----------------
+      if (chain.didCancel && chain.didEnter && !chain.didBatch) {
+        if (!chain.batchMsg) {
+          return { ok:true, queued:'waiting_for_BATCH_TPS', sig_id: sigId, symbol: psym, have:{ cancel:!!chain.cancelMsg, enter:!!chain.enterMsg, batch:!!chain.batchMsg }, did:{ cancel:chain.didCancel, enter:chain.didEnter, batch:chain.didBatch } };
+        }
+
+        const r = await placeBatch(chain.batchMsg);
         chain.didBatch = true;
-        progressed.push(batchOut);
+        if (STRICT_SEQUENCE) setSigState(sigId, psym, { lastSeq: 2 });
+
+        progressed.push({ ok:true, step:'batch', r, symbol: psym });
       }
 
       const have = { cancel: !!chain.cancelMsg, enter: !!chain.enterMsg, batch: !!chain.batchMsg };
       const did  = { cancel: !!chain.didCancel, enter: !!chain.didEnter, batch: !!chain.didBatch };
 
-      // If nothing progressed, tell what we’re waiting for
-      if (!progressed.length) {
-        let waiting = 'waiting_for_CANCAL';
-        if (did.cancel && !have.enter) waiting = 'waiting_for_ENTER';
-        if (did.cancel && have.enter && did.enter && !have.batch) waiting = 'waiting_for_BATCH_TPS';
-        return { ok:true, queued: waiting, sig_id: sigId, symbol: psym, have, did };
-      }
-
-      // If partially progressed, still show what remains
-      let status = 'progressed';
-      if (did.cancel && did.enter && did.batch) status = 'done';
-
-      return { ok:true, status, sig_id: sigId, symbol: psym, have, did, progressed };
+      return { ok:true, status: (did.cancel && did.enter && did.batch) ? 'done' : 'progressed', sig_id: sigId, symbol: psym, have, did, progressed };
     });
 
     return res.json(out);
@@ -975,5 +927,5 @@ app.post('/tv', async (req, res) => {
 });
 
 app.listen(PORT, ()=>console.log(
-  `Relay listening http://localhost:${PORT} (BASE=${BASE_URL}, AUTH=${AUTH_MODE}, STRICT_SEQUENCE=${STRICT_SEQUENCE}, FAST_ENTER=${FAST_ENTER}, SIGNAL_CHAIN_WINDOW_MS=${SIGNAL_CHAIN_WINDOW_MS}, AUTO_CANCEL_ON_ENTER=${AUTO_CANCEL_ON_ENTER})`
+  `Relay listening http://localhost:${PORT} (BASE=${BASE_URL}, AUTH=${AUTH_MODE}, STRICT_SEQUENCE=${STRICT_SEQUENCE}, FAST_ENTER=${FAST_ENTER}, SIGNAL_CHAIN_WINDOW_MS=${SIGNAL_CHAIN_WINDOW_MS}, AUTO_CANCEL_ON_ENTER=${AUTO_CANCEL_ON_ENTER}, FORCE_CLOSE_ON_CANCEL=${FORCE_CLOSE_ON_CANCEL})`
 ));

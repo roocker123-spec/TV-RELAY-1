@@ -893,7 +893,7 @@ app.post('/tv', async (req, res) => {
           const steps = await flattenFromCancelMsg(cancelMsg, psym);
 
           // If cancel message itself requests require_flat, honor it.
-          const requireFlat = (typeof cancelMsg.require_flat === 'undefined') ? true : !!cancelMsg.require_flat;
+          const requireFlat = (typeof cancelMsg.require_flat === 'undefined') ? false : !!cancelMsg.require_flat;
           let flat = true;
           if (requireFlat) {
             flat = isScopeAll(cancelMsg) ? await waitUntilFlat() : await waitUntilFlatSymbol(psym);
@@ -1038,3 +1038,4 @@ app.post('/tv', async (req, res) => {
 app.listen(PORT, ()=>console.log(
   `Relay listening http://localhost:${PORT} (BASE=${BASE_URL}, AUTH=${AUTH_MODE}, STRICT_SEQUENCE=${STRICT_SEQUENCE}, FAST_ENTER=${FAST_ENTER}, SIGNAL_CHAIN_WINDOW_MS=${SIGNAL_CHAIN_WINDOW_MS}, AUTO_CANCEL_ON_ENTER=${AUTO_CANCEL_ON_ENTER}, FORCE_CLOSE_ON_CANCEL=${FORCE_CLOSE_ON_CANCEL})`
 ));
+

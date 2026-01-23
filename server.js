@@ -1,15 +1,15 @@
 // server.js (FULL) — PER-SYMBOL queue/lock, sig_id+seq idempotency,
 // STRICT sequencing: expects CANCAL(seq0) -> ENTER(seq1) -> BATCH_TPS(seq2)
 //
-// ✅ THIS VERSION ENFORCES TRUE ORDER:
-// - CANCAL is the ONLY step that cancels orders / closes positions.
-// - ENTER will NOT cancel/close; it only waits for flat (if require_flat) then enters.
-// - BATCH_TPS only places TP batch.
+// ✅ THIS VERSION MATCHES YOUR PINE PAYLOADS:
+// - CANCAL(seq0): typically cancel_orders=true, close_position=false  (your Pine does this)
+// - ENTER(seq1): cancel_orders=true, close_position=true, require_flat=true (your Pine does this)
+// - BATCH_TPS(seq2): places TP batch
 //
 // ✅ FIXES INCLUDED:
-// 1) Chain draining: if messages arrive out-of-order, every request tries to progress
-//    cancel -> enter -> batch using buffered msgs.
-// 2) Position closing fix: Delta position size often is LOTS/contracts (e.g., -4 IP).
+// 1) Chain draining: out-of-order arrival still progresses cancel -> enter -> batch using buffered msgs.
+// 2) ENTER preflight: does cancel/close (if flags true) BEFORE waiting flat and entering.
+// 3) Position closing fix: Delta position size often is LOTS/contracts (e.g., -4 IP).
 //    We detect that and close using lots directly.
 //
 // ⚠️ Cloud Run: Use Max instances = 1 (and ideally concurrency = 1) OR store state in Redis/Firestore.
@@ -105,11 +105,10 @@ const STRICT_SEQUENCE = String(process.env.STRICT_SEQUENCE || 'true').toLowerCas
 // ✅ chain window to ensure "same bar burst" (default 15s)
 const SIGNAL_CHAIN_WINDOW_MS = nnum(process.env.SIGNAL_CHAIN_WINDOW_MS, 15_000);
 
-// ✅ IMPORTANT: for YOUR desired behavior keep this FALSE
-// If true, ENTER could synthesize cancel (not what you want)
+// If true, ENTER could synthesize cancel. Usually keep false.
 const AUTO_CANCEL_ON_ENTER = String(process.env.AUTO_CANCEL_ON_ENTER || 'false').toLowerCase() === 'true';
 
-// ✅ Force behavior for CANCAL step defaults
+// Defaults for cancel step ONLY (applied only when undefined on the incoming message)
 const FORCE_CANCEL_ORDERS_ON_CANCEL = String(process.env.FORCE_CANCEL_ORDERS_ON_CANCEL || 'true').toLowerCase() !== 'false';
 const FORCE_CLOSE_ON_CANCEL         = String(process.env.FORCE_CLOSE_ON_CANCEL || 'true').toLowerCase() !== 'false';
 
@@ -163,7 +162,7 @@ function setSigState(sig_id, psym, patch){
 }
 
 // -------------------- CHAIN BUFFER --------------------
-const CHAIN = new Map(); // key(sig_id|symbol) -> { createdAt, cancelMsg, enterMsg, batchMsg, didCancel, didEnter, didBatch, lastTouch }
+const CHAIN = new Map(); // key(sig_id|symbol) -> { createdAt, cancelMsg, enterMsg, batchMsg, didCancel, didEnterPrep, didEnter, didBatch, lastTouch }
 const CHAIN_TTL_MS = 2 * 60 * 1000;
 
 function cleanupChain(){
@@ -185,6 +184,7 @@ function getChain(sigId, psym){
       enterMsg: null,
       batchMsg: null,
       didCancel: false,
+      didEnterPrep: false, // ✅ new: prevents repeated cancel/close preflight if entry step retries
       didEnter: false,
       didBatch: false
     };
@@ -681,10 +681,11 @@ async function isFlatNowSymbol(psym){
   } catch { return false; }
 }
 
+// ----- Flatten helper for CANCAL (seq0) -----
 async function flattenFromCancelMsg(cancelMsg, psym){
   const scopeAll = isScopeAll(cancelMsg);
 
-  // ✅ Force defaults on cancel step (unless explicitly set false)
+  // Apply defaults on cancel step ONLY when fields are undefined.
   if (FORCE_CANCEL_ORDERS_ON_CANCEL && typeof cancelMsg.cancel_orders === 'undefined') cancelMsg.cancel_orders = true;
   if (FORCE_CLOSE_ON_CANCEL && typeof cancelMsg.close_position === 'undefined') cancelMsg.close_position = true;
 
@@ -747,6 +748,69 @@ async function flattenFromCancelMsg(cancelMsg, psym){
   return steps;
 }
 
+// ----- Preflight helper for ENTER (seq1) — matches Pine ENTER cancel/close flags -----
+async function preflightFromEnterMsg(enterMsg, psym){
+  const scopeAll = isScopeAll(enterMsg);
+
+  const doCancelOrders = !!enterMsg.cancel_orders;
+  const doClosePos     = !!enterMsg.close_position;
+
+  const cancelScope = String(
+    enterMsg.cancel_orders_scope || (scopeAll ? 'ALL' : 'SYMBOL')
+  ).toUpperCase();
+
+  const cancelFallbackAll = !!enterMsg.cancel_fallback_all;
+
+  const steps = {
+    cancel_orders: false,
+    close_position: false,
+    cancel_mode: null,
+    close_mode: null,
+    cancel_error: null,
+    close_error: null
+  };
+
+  if (doCancelOrders) {
+    try {
+      if (scopeAll || cancelScope === 'ALL') {
+        await cancelAllOrders();
+        steps.cancel_mode = 'cancel_all_orders';
+      } else {
+        await cancelOrdersBySymbol(psym, { fallbackAll: cancelFallbackAll });
+        steps.cancel_mode = 'cancel_symbol_orders';
+      }
+      steps.cancel_orders = true;
+    } catch (e) {
+      steps.cancel_error = String(e?.message || e);
+      console.warn('enter preflight: cancel failed:', e?.message || e);
+    }
+  }
+
+  if (doClosePos) {
+    try {
+      if (scopeAll) {
+        await closeAllPositions();
+        steps.close_mode = 'close_all_positions';
+      } else {
+        const sym = enterMsg.symbol || enterMsg.product_symbol || psym;
+        if (sym) {
+          await closePositionBySymbol(sym);
+          steps.close_mode = 'close_by_symbol';
+        } else {
+          await closeAllPositions();
+          steps.close_mode = 'close_all_positions';
+        }
+      }
+      steps.close_position = true;
+    } catch (e) {
+      steps.close_error = String(e?.message || e);
+      console.warn('enter preflight: close failed:', e?.message || e);
+    }
+  }
+
+  return steps;
+}
+
 // ---------- health ----------
 app.get('/health', (_req,res)=>res.json({ok:true, started_at:process.env.__STARTED_AT}));
 app.get('/healthz', (_req,res)=>res.send('ok'));
@@ -760,6 +824,7 @@ app.get('/debug/chain', (_req,res)=>{
       createdAt: v.createdAt,
       lastTouch: v.lastTouch,
       didCancel: v.didCancel,
+      didEnterPrep: v.didEnterPrep,
       didEnter:  v.didEnter,
       didBatch:  v.didBatch,
       haveCancel: !!v.cancelMsg,
@@ -819,7 +884,7 @@ app.post('/tv', async (req, res) => {
 
       const progressed = [];
 
-      // ---------------- STEP 1: CANCAL ----------------
+      // ---------------- STEP 1: CANCAL (seq0) ----------------
       if (!chain.didCancel) {
         if (chain.cancelMsg) {
           const cancelMsg = chain.cancelMsg;
@@ -827,6 +892,7 @@ app.post('/tv', async (req, res) => {
 
           const steps = await flattenFromCancelMsg(cancelMsg, psym);
 
+          // If cancel message itself requests require_flat, honor it.
           const requireFlat = (typeof cancelMsg.require_flat === 'undefined') ? true : !!cancelMsg.require_flat;
           let flat = true;
           if (requireFlat) {
@@ -838,7 +904,7 @@ app.post('/tv', async (req, res) => {
 
           progressed.push({ ok:true, did:'CANCAL', steps, flat, symbol: psym });
         } else {
-          // If you accidentally enabled AUTO_CANCEL_ON_ENTER it can break your desired order
+          // If AUTO_CANCEL_ON_ENTER is enabled, we can synthesize a cancel from ENTER.
           if (AUTO_CANCEL_ON_ENTER && chain.enterMsg) {
             const syntheticCancel = { ...chain.enterMsg, action:'CANCAL', seq:0, cancel_orders_scope:'SYMBOL' };
             const steps = await flattenFromCancelMsg(syntheticCancel, psym);
@@ -848,20 +914,48 @@ app.post('/tv', async (req, res) => {
             if (STRICT_SEQUENCE) setSigState(sigId, psym, { lastSeq: 0 });
             progressed.push({ ok:true, did:'CANCAL', synthetic:true, steps, flat, symbol: psym });
           } else {
-            return { ok:true, queued:'waiting_for_CANCAL', sig_id: sigId, symbol: psym, have:{ cancel:!!chain.cancelMsg, enter:!!chain.enterMsg, batch:!!chain.batchMsg }, did:{ cancel:chain.didCancel, enter:chain.didEnter, batch:chain.didBatch } };
+            // ✅ To avoid stalling when Pine disables CANCAL, allow progression if ENTER exists.
+            // ENTER step will do the cancel/close per Pine flags anyway.
+            if (chain.enterMsg) {
+              chain.didCancel = true;
+              if (STRICT_SEQUENCE) setSigState(sigId, psym, { lastSeq: 0 });
+              progressed.push({ ok:true, did:'CANCAL', skipped:true, note:'No seq0 received; proceeding because ENTER exists', symbol: psym });
+            } else {
+              return {
+                ok:true,
+                queued:'waiting_for_CANCAL',
+                sig_id: sigId,
+                symbol: psym,
+                have:{ cancel:!!chain.cancelMsg, enter:!!chain.enterMsg, batch:!!chain.batchMsg },
+                did:{ cancel:chain.didCancel, enter:chain.didEnter, batch:chain.didBatch }
+              };
+            }
           }
         }
       }
 
-      // ---------------- STEP 2: ENTER ----------------
+      // ---------------- STEP 2: ENTER (seq1) ----------------
       if (chain.didCancel && !chain.didEnter) {
         if (!chain.enterMsg) {
-          return { ok:true, queued:'waiting_for_ENTER', sig_id: sigId, symbol: psym, have:{ cancel:!!chain.cancelMsg, enter:!!chain.enterMsg, batch:!!chain.batchMsg }, did:{ cancel:chain.didCancel, enter:chain.didEnter, batch:chain.didBatch } };
+          return {
+            ok:true,
+            queued:'waiting_for_ENTER',
+            sig_id: sigId,
+            symbol: psym,
+            have:{ cancel:!!chain.cancelMsg, enter:!!chain.enterMsg, batch:!!chain.batchMsg },
+            did:{ cancel:chain.didCancel, enter:chain.didEnter, batch:chain.didBatch }
+          };
         }
 
         const enterMsg = chain.enterMsg;
 
-        // ✅ ENTER DOES NOT CANCEL/CLOSE ANYTHING NOW
+        // ✅ MATCH PINE: ENTER can cancel_orders & close_position BEFORE entry.
+        if (!chain.didEnterPrep) {
+          const pre = await preflightFromEnterMsg(enterMsg, psym);
+          chain.didEnterPrep = true;
+          progressed.push({ ok:true, did:'ENTER_PRE', pre, symbol: psym });
+        }
+
         const requireFlat = (typeof enterMsg.require_flat === 'undefined') ? true : !!enterMsg.require_flat;
 
         if (requireFlat) {
@@ -880,13 +974,13 @@ app.post('/tv', async (req, res) => {
                   : await waitUntilFlatSymbol(psym, FAST_ENTER_RETRY_MS, FLAT_POLL_MS);
 
                 if (!flatRetry) {
-                  return { ok:false, error:'require_flat_timeout', sig_id: sigId, symbol: psym, stage:'ENTER', note:'Not flat after cancel. Entry blocked.' };
+                  return { ok:false, error:'require_flat_timeout', sig_id: sigId, symbol: psym, stage:'ENTER', note:'Not flat after ENTER preflight. Entry blocked.' };
                 }
               }
             } else {
               const flat = isScopeAll(enterMsg) ? await waitUntilFlat() : await waitUntilFlatSymbol(psym);
               if (!flat) {
-                return { ok:false, error:'require_flat_timeout', sig_id: sigId, symbol: psym, stage:'ENTER', note:'Not flat after cancel. Entry blocked.' };
+                return { ok:false, error:'require_flat_timeout', sig_id: sigId, symbol: psym, stage:'ENTER', note:'Not flat after ENTER preflight. Entry blocked.' };
               }
             }
           }
@@ -899,10 +993,17 @@ app.post('/tv', async (req, res) => {
         progressed.push({ ok:true, step:'entry', r, symbol: psym });
       }
 
-      // ---------------- STEP 3: BATCH_TPS ----------------
+      // ---------------- STEP 3: BATCH_TPS (seq2) ----------------
       if (chain.didCancel && chain.didEnter && !chain.didBatch) {
         if (!chain.batchMsg) {
-          return { ok:true, queued:'waiting_for_BATCH_TPS', sig_id: sigId, symbol: psym, have:{ cancel:!!chain.cancelMsg, enter:!!chain.enterMsg, batch:!!chain.batchMsg }, did:{ cancel:chain.didCancel, enter:chain.didEnter, batch:chain.didBatch } };
+          return {
+            ok:true,
+            queued:'waiting_for_BATCH_TPS',
+            sig_id: sigId,
+            symbol: psym,
+            have:{ cancel:!!chain.cancelMsg, enter:!!chain.enterMsg, batch:!!chain.batchMsg },
+            did:{ cancel:chain.didCancel, enter:chain.didEnter, batch:chain.didBatch }
+          };
         }
 
         const r = await placeBatch(chain.batchMsg);
@@ -913,9 +1014,17 @@ app.post('/tv', async (req, res) => {
       }
 
       const have = { cancel: !!chain.cancelMsg, enter: !!chain.enterMsg, batch: !!chain.batchMsg };
-      const did  = { cancel: !!chain.didCancel, enter: !!chain.didEnter, batch: !!chain.didBatch };
+      const did  = { cancel: !!chain.didCancel, enterPrep: !!chain.didEnterPrep, enter: !!chain.didEnter, batch: !!chain.didBatch };
 
-      return { ok:true, status: (did.cancel && did.enter && did.batch) ? 'done' : 'progressed', sig_id: sigId, symbol: psym, have, did, progressed };
+      return {
+        ok:true,
+        status: (did.cancel && did.enter && did.batch) ? 'done' : 'progressed',
+        sig_id: sigId,
+        symbol: psym,
+        have,
+        did,
+        progressed
+      };
     });
 
     return res.json(out);

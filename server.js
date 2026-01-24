@@ -1,14 +1,14 @@
 // server.js (FULL) — PER-SYMBOL queue/lock, sig_id+seq idempotency,
 // STRICT sequencing: expects CANCAL(seq0) -> ENTER(seq1) -> BATCH_TPS(seq2)
 //
-// ✅ THIS VERSION MATCHES YOUR PINE PAYLOADS:
-// - CANCAL(seq0): typically cancel_orders=true, close_position=false  (your Pine does this)
-// - ENTER(seq1): cancel_orders=true, close_position=true, require_flat=true (your Pine does this)
-// - BATCH_TPS(seq2): places TP batch
+// ✅ UPDATED FOR YOUR NEW PINE INTENT:
+// - CANCAL(seq0): flatten EVERYTHING (cancel all orders + close all positions) by default
+// - ENTER(seq1): defaults to NOT waiting flat (so it can fire immediately next bar)
+//   (you can still force waiting by sending require_flat=true from Pine)
 //
 // ✅ FIXES INCLUDED:
 // 1) Chain draining: out-of-order arrival still progresses cancel -> enter -> batch using buffered msgs.
-// 2) ENTER preflight: does cancel/close (if flags true) BEFORE waiting flat and entering.
+// 2) ENTER preflight: does cancel/close (if flags true) BEFORE optional flat wait and entering.
 // 3) Position closing fix: Delta position size often is LOTS/contracts (e.g., -4 IP).
 //    We detect that and close using lots directly.
 //
@@ -108,9 +108,19 @@ const SIGNAL_CHAIN_WINDOW_MS = nnum(process.env.SIGNAL_CHAIN_WINDOW_MS, 15_000);
 // If true, ENTER could synthesize cancel. Usually keep false.
 const AUTO_CANCEL_ON_ENTER = String(process.env.AUTO_CANCEL_ON_ENTER || 'false').toLowerCase() === 'true';
 
+// ✅ NEW: default cancel scope for CANCAL when Pine doesn't explicitly set it
+// Set to "ALL" for your new behavior (default), or "SYMBOL" to revert.
+const DEFAULT_CANCEL_SCOPE = String(process.env.DEFAULT_CANCEL_SCOPE || 'ALL').toUpperCase(); // ALL|SYMBOL
+
 // Defaults for cancel step ONLY (applied only when undefined on the incoming message)
 const FORCE_CANCEL_ORDERS_ON_CANCEL = String(process.env.FORCE_CANCEL_ORDERS_ON_CANCEL || 'true').toLowerCase() !== 'false';
 const FORCE_CLOSE_ON_CANCEL         = String(process.env.FORCE_CLOSE_ON_CANCEL || 'true').toLowerCase() !== 'false';
+
+// ✅ NEW: ENTER require_flat default (so ENTER can fire immediately next bar)
+const ENTER_REQUIRE_FLAT_DEFAULT = String(process.env.ENTER_REQUIRE_FLAT_DEFAULT || 'false').toLowerCase() === 'true';
+
+// ✅ NEW: small delay after cancel/close before entry (lets exchange state settle)
+const ENTER_POST_CANCEL_DELAY_MS = nnum(process.env.ENTER_POST_CANCEL_DELAY_MS, 150);
 
 // ---------- idempotency (drops dupes ~60s) ----------
 const SEEN = new Map();              // key -> ts(ms)
@@ -184,7 +194,7 @@ function getChain(sigId, psym){
       enterMsg: null,
       batchMsg: null,
       didCancel: false,
-      didEnterPrep: false, // ✅ new: prevents repeated cancel/close preflight if entry step retries
+      didEnterPrep: false, // ✅ prevents repeated cancel/close preflight if entry step retries
       didEnter: false,
       didBatch: false
     };
@@ -682,8 +692,11 @@ async function isFlatNowSymbol(psym){
 }
 
 // ----- Flatten helper for CANCAL (seq0) -----
+// ✅ Updated: defaults to ALL-scope flatten if Pine doesn't specify scope/close_all.
 async function flattenFromCancelMsg(cancelMsg, psym){
-  const scopeAll = isScopeAll(cancelMsg);
+  // If Pine explicitly says close_all/scope=ALL => global.
+  // Otherwise default to DEFAULT_CANCEL_SCOPE (ALL by default for your new behavior).
+  const scopeAll = isScopeAll(cancelMsg) || (DEFAULT_CANCEL_SCOPE === 'ALL');
 
   // Apply defaults on cancel step ONLY when fields are undefined.
   if (FORCE_CANCEL_ORDERS_ON_CANCEL && typeof cancelMsg.cancel_orders === 'undefined') cancelMsg.cancel_orders = true;
@@ -692,8 +705,18 @@ async function flattenFromCancelMsg(cancelMsg, psym){
   const doCancelOrders = (typeof cancelMsg.cancel_orders === 'undefined') ? true : !!cancelMsg.cancel_orders;
   const doClosePos     = (typeof cancelMsg.close_position === 'undefined') ? true : !!cancelMsg.close_position;
 
+  // Scope for cancelling orders
   const cancelScope = String(
-    cancelMsg.cancel_orders_scope || (scopeAll ? 'ALL' : 'SYMBOL')
+    cancelMsg.cancel_orders_scope ||
+    cancelMsg.scope ||
+    (scopeAll ? 'ALL' : 'SYMBOL')
+  ).toUpperCase();
+
+  // Scope for closing positions (optional override)
+  const closeScope = String(
+    cancelMsg.close_position_scope ||
+    cancelMsg.scope ||
+    (scopeAll ? 'ALL' : 'SYMBOL')
   ).toUpperCase();
 
   const cancelFallbackAll = !!cancelMsg.cancel_fallback_all;
@@ -725,7 +748,7 @@ async function flattenFromCancelMsg(cancelMsg, psym){
 
   if (doClosePos) {
     try {
-      if (scopeAll) {
+      if (scopeAll || closeScope === 'ALL') {
         await closeAllPositions();
         steps.close_mode = 'close_all_positions';
       } else {
@@ -759,6 +782,10 @@ async function preflightFromEnterMsg(enterMsg, psym){
     enterMsg.cancel_orders_scope || (scopeAll ? 'ALL' : 'SYMBOL')
   ).toUpperCase();
 
+  const closeScope = String(
+    enterMsg.close_position_scope || enterMsg.scope || (scopeAll ? 'ALL' : 'SYMBOL')
+  ).toUpperCase();
+
   const cancelFallbackAll = !!enterMsg.cancel_fallback_all;
 
   const steps = {
@@ -788,7 +815,7 @@ async function preflightFromEnterMsg(enterMsg, psym){
 
   if (doClosePos) {
     try {
-      if (scopeAll) {
+      if (scopeAll || closeScope === 'ALL') {
         await closeAllPositions();
         steps.close_mode = 'close_all_positions';
       } else {
@@ -888,7 +915,13 @@ app.post('/tv', async (req, res) => {
       if (!chain.didCancel) {
         if (chain.cancelMsg) {
           const cancelMsg = chain.cancelMsg;
-          if (typeof cancelMsg.cancel_orders_scope === 'undefined') cancelMsg.cancel_orders_scope = 'SYMBOL';
+
+          // ✅ default to ALL cancel on seq0 if not specified (new behavior)
+          if (typeof cancelMsg.cancel_orders_scope === 'undefined' && typeof cancelMsg.scope === 'undefined' && typeof cancelMsg.close_all === 'undefined') {
+            cancelMsg.cancel_orders_scope = DEFAULT_CANCEL_SCOPE; // ALL by default
+            cancelMsg.scope = DEFAULT_CANCEL_SCOPE;
+            if (DEFAULT_CANCEL_SCOPE === 'ALL') cancelMsg.close_all = true;
+          }
 
           const steps = await flattenFromCancelMsg(cancelMsg, psym);
 
@@ -906,7 +939,9 @@ app.post('/tv', async (req, res) => {
         } else {
           // If AUTO_CANCEL_ON_ENTER is enabled, we can synthesize a cancel from ENTER.
           if (AUTO_CANCEL_ON_ENTER && chain.enterMsg) {
-            const syntheticCancel = { ...chain.enterMsg, action:'CANCAL', seq:0, cancel_orders_scope:'SYMBOL' };
+            const syntheticCancel = { ...chain.enterMsg, action:'CANCAL', seq:0, cancel_orders_scope: DEFAULT_CANCEL_SCOPE, scope: DEFAULT_CANCEL_SCOPE };
+            if (DEFAULT_CANCEL_SCOPE === 'ALL') syntheticCancel.close_all = true;
+
             const steps = await flattenFromCancelMsg(syntheticCancel, psym);
             const flat = isScopeAll(syntheticCancel) ? await waitUntilFlat() : await waitUntilFlatSymbol(psym);
 
@@ -956,7 +991,12 @@ app.post('/tv', async (req, res) => {
           progressed.push({ ok:true, did:'ENTER_PRE', pre, symbol: psym });
         }
 
-        const requireFlat = (typeof enterMsg.require_flat === 'undefined') ? true : !!enterMsg.require_flat;
+        // ✅ small settle delay after flatten/preflight
+        if (ENTER_POST_CANCEL_DELAY_MS > 0) await sleep(ENTER_POST_CANCEL_DELAY_MS);
+
+        // ✅ UPDATED DEFAULT: allow immediate entry unless Pine explicitly requires flat
+        const requireFlat =
+          (typeof enterMsg.require_flat === 'undefined') ? ENTER_REQUIRE_FLAT_DEFAULT : !!enterMsg.require_flat;
 
         if (requireFlat) {
           // quick check
@@ -1036,6 +1076,5 @@ app.post('/tv', async (req, res) => {
 });
 
 app.listen(PORT, ()=>console.log(
-  `Relay listening http://localhost:${PORT} (BASE=${BASE_URL}, AUTH=${AUTH_MODE}, STRICT_SEQUENCE=${STRICT_SEQUENCE}, FAST_ENTER=${FAST_ENTER}, SIGNAL_CHAIN_WINDOW_MS=${SIGNAL_CHAIN_WINDOW_MS}, AUTO_CANCEL_ON_ENTER=${AUTO_CANCEL_ON_ENTER}, FORCE_CLOSE_ON_CANCEL=${FORCE_CLOSE_ON_CANCEL})`
+  `Relay listening http://localhost:${PORT} (BASE=${BASE_URL}, AUTH=${AUTH_MODE}, STRICT_SEQUENCE=${STRICT_SEQUENCE}, FAST_ENTER=${FAST_ENTER}, SIGNAL_CHAIN_WINDOW_MS=${SIGNAL_CHAIN_WINDOW_MS}, AUTO_CANCEL_ON_ENTER=${AUTO_CANCEL_ON_ENTER}, DEFAULT_CANCEL_SCOPE=${DEFAULT_CANCEL_SCOPE}, ENTER_REQUIRE_FLAT_DEFAULT=${ENTER_REQUIRE_FLAT_DEFAULT}, ENTER_POST_CANCEL_DELAY_MS=${ENTER_POST_CANCEL_DELAY_MS}, FORCE_CLOSE_ON_CANCEL=${FORCE_CLOSE_ON_CANCEL})`
 ));
-

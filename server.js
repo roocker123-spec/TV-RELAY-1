@@ -1,22 +1,16 @@
 // server.js (FULL) — PER-SYMBOL queue/lock, sig_id+seq idempotency,
 // STRICT sequencing: expects CANCAL(seq0) -> ENTER(seq1) -> BATCH_TPS(seq2)
 //
-// ✅ UPDATED FOR YOUR NEW PINE INTENT:
-// - CANCAL(seq0): flatten EVERYTHING (cancel all orders + close all positions) by default
-// - ENTER(seq1): defaults to NOT waiting flat (so it can fire immediately next bar)
-//   (you can still force waiting by sending require_flat=true from Pine)
+// ✅ THIS VERSION MATCHES YOUR PINE PAYLOADS:
+// - CANCAL(seq0): typically cancel_orders=true, close_position=false  (your Pine does this)
+// - ENTER(seq1): cancel_orders=true, close_position=true, require_flat=true (your Pine does this)
+// - BATCH_TPS(seq2): places TP batch
 //
 // ✅ FIXES INCLUDED:
 // 1) Chain draining: out-of-order arrival still progresses cancel -> enter -> batch using buffered msgs.
-// 2) ENTER preflight: does cancel/close (if flags true) BEFORE optional flat wait and entering.
+// 2) ENTER preflight: does cancel/close (if flags true) BEFORE waiting flat and entering.
 // 3) Position closing fix: Delta position size often is LOTS/contracts (e.g., -4 IP).
 //    We detect that and close using lots directly.
-//
-// ✅ NEW (YOUR ISSUE FIX):
-// 4) AUTO-DOWNSIZE on insufficient margin: if Delta rejects (insufficient funds/margin),
-//    server reduces size and retries until it fits.
-// 5) Parses "Rs.2000" / "₹2,000" / "10x" properly.
-// 6) Optional LOT MULT overrides via env LOT_MULT_OVERRIDES_JSON='{"PIPPINUSD":100}'
 //
 // ⚠️ Cloud Run: Use Max instances = 1 (and ideally concurrency = 1) OR store state in Redis/Firestore.
 
@@ -29,27 +23,7 @@ const fetch   = global.fetch; // Node 18+
 function nowTsSec(){ return Math.floor(Date.now()/1000).toString(); }
 function sleep(ms){ return new Promise(r=>setTimeout(r,ms)); }
 function clamp(n,min,max){ return Math.min(Math.max(n,min),max); }
-
-// Extract first number from strings like "Rs.2,000", "10x", "₹1000"
-function parseNumberLoose(x){
-  if (typeof x === 'number') return Number.isFinite(x) ? x : NaN;
-  const s = String(x ?? '').trim();
-  if (!s) return NaN;
-  // keep digits, dot, minus
-  const m = s.replace(/,/g,'').match(/-?\d+(\.\d+)?/);
-  return m ? Number(m[0]) : NaN;
-}
-function nnum(x, d=0){
-  const n = parseNumberLoose(x);
-  return Number.isFinite(n) ? n : d;
-}
-function toBool(x){
-  if (typeof x === 'boolean') return x;
-  const s = String(x ?? '').toLowerCase().trim();
-  if (['1','true','yes','y','on'].includes(s)) return true;
-  if (['0','false','no','n','off'].includes(s)) return false;
-  return !!x;
-}
+function nnum(x, d=0){ const n = Number(x); return Number.isFinite(n) ? n : d; }
 
 function toProductSymbol(sym){
   if(!sym) return sym;
@@ -57,24 +31,11 @@ function toProductSymbol(sym){
   if(s.includes(':')) s = s.split(':').pop();     // remove prefix like BINANCE:
   return s;
 }
-function safeUpper(x){ return String(x||'').toUpperCase(); }
 function isScopeAll(msg){
   return String(msg.scope||'').toUpperCase() === 'ALL' || !!msg.close_all;
 }
+function safeUpper(x){ return String(x||'').toUpperCase(); }
 function sigKey(sigId, psym){ return `${String(sigId||'')}|${safeUpper(psym||'')}`; }
-
-function looksLikeInsufficient(err){
-  const s = String(err?.message || err || '').toLowerCase();
-  return (
-    s.includes('insufficient') ||
-    s.includes('not enough') ||
-    s.includes('insufficient_balance') ||
-    s.includes('insufficient margin') ||
-    s.includes('insufficient_margin') ||
-    s.includes('margin is insufficient') ||
-    s.includes('balance is insufficient')
-  );
-}
 
 // ---------- queue (serializes webhook execution) ----------
 const QUEUE = new Map(); // key -> Promise chain
@@ -105,9 +66,8 @@ app.use((req, _res, next) => {
       req.body = qs.parse(req.body);
     }
   }
-  // keep qty as int if present
   if (req.body && typeof req.body.qty !== 'undefined') {
-    const q = parseInt(String(req.body.qty).replace(/[^0-9-]/g,''), 10);
+    const q = parseInt(req.body.qty, 10);
     if (!Number.isNaN(q)) req.body.qty = q;
   }
   next();
@@ -148,35 +108,9 @@ const SIGNAL_CHAIN_WINDOW_MS = nnum(process.env.SIGNAL_CHAIN_WINDOW_MS, 15_000);
 // If true, ENTER could synthesize cancel. Usually keep false.
 const AUTO_CANCEL_ON_ENTER = String(process.env.AUTO_CANCEL_ON_ENTER || 'false').toLowerCase() === 'true';
 
-// ✅ NEW: default cancel scope for CANCAL when Pine doesn't explicitly set it
-const DEFAULT_CANCEL_SCOPE = String(process.env.DEFAULT_CANCEL_SCOPE || 'ALL').toUpperCase(); // ALL|SYMBOL
-
 // Defaults for cancel step ONLY (applied only when undefined on the incoming message)
 const FORCE_CANCEL_ORDERS_ON_CANCEL = String(process.env.FORCE_CANCEL_ORDERS_ON_CANCEL || 'true').toLowerCase() !== 'false';
 const FORCE_CLOSE_ON_CANCEL         = String(process.env.FORCE_CLOSE_ON_CANCEL || 'true').toLowerCase() !== 'false';
-
-// ✅ NEW: ENTER require_flat default (so ENTER can fire immediately next bar)
-const ENTER_REQUIRE_FLAT_DEFAULT = String(process.env.ENTER_REQUIRE_FLAT_DEFAULT || 'false').toLowerCase() === 'true';
-
-// ✅ NEW: small delay after cancel/close before entry (lets exchange state settle)
-const ENTER_POST_CANCEL_DELAY_MS = nnum(process.env.ENTER_POST_CANCEL_DELAY_MS, 150);
-
-// ✅ NEW: Auto-downsize/retry on insufficient margin
-const ENTRY_AUTO_DOWNSIZE_ON_INSUFF = String(process.env.ENTRY_AUTO_DOWNSIZE_ON_INSUFF || 'true').toLowerCase() !== 'false';
-const ENTRY_DOWNSIZE_MAX_TRIES      = nnum(process.env.ENTRY_DOWNSIZE_MAX_TRIES, 7);
-const ENTRY_DOWNSIZE_FACTOR         = nnum(process.env.ENTRY_DOWNSIZE_FACTOR, 0.72); // reduce to 72% each try
-const ENTRY_MIN_LOTS                = Math.max(1, Math.floor(nnum(process.env.ENTRY_MIN_LOTS, 1)));
-
-// Optional known lot sizes per symbol: {"PIPPINUSD":100,"HANAUSD":10}
-let LOT_MULT_OVERRIDES = {};
-try {
-  LOT_MULT_OVERRIDES = JSON.parse(process.env.LOT_MULT_OVERRIDES_JSON || '{}') || {};
-} catch { LOT_MULT_OVERRIDES = {}; }
-function getOverrideLotMult(psym){
-  const v = LOT_MULT_OVERRIDES[safeUpper(psym)];
-  const n = Number(v);
-  return Number.isFinite(n) && n >= 1 ? Math.round(n) : null;
-}
 
 // ---------- idempotency (drops dupes ~60s) ----------
 const SEEN = new Map();              // key -> ts(ms)
@@ -250,7 +184,7 @@ function getChain(sigId, psym){
       enterMsg: null,
       batchMsg: null,
       didCancel: false,
-      didEnterPrep: false, // ✅ prevents repeated cancel/close preflight if entry step retries
+      didEnterPrep: false, // ✅ new: prevents repeated cancel/close preflight if entry step retries
       didEnter: false,
       didBatch: false
     };
@@ -342,24 +276,15 @@ async function getProductIdBySymbol(psym){
 
 const LOT_MULT_CACHE = new Map(); // product_symbol -> { m, ts }
 function lotMultiplierFromMeta(meta){
-  // IMPORTANT:
-  // We want "coins per 1 contract/lot". Delta varies by product.
-  // We try to pick the most reasonable INTEGER multiplier if present.
   const cand = [
-    meta?.lot_size,
-    meta?.contract_size,
     meta?.contract_value,
+    meta?.contract_size,
+    meta?.lot_size,
     meta?.contract_unit,
     meta?.qty_step
   ].map(n => Number.isFinite(+n) ? +n : NaN).filter(n => n && n > 0);
 
-  // Prefer integers >= 1
-  const ints = cand
-    .filter(n => Math.abs(n - Math.round(n)) < 1e-6)
-    .map(n => Math.round(n))
-    .filter(n => n >= 1);
-
-  // Choose the MAX integer multiplier (safer: bigger mult => smaller lots => avoids oversizing)
+  const ints = cand.filter(n => Math.abs(n - Math.round(n)) < 1e-6);
   let m = (ints.length ? Math.max(...ints) : (cand.length ? Math.max(...cand) : 1));
   if (!Number.isFinite(m) || m < 1) m = 1;
   return Math.round(m);
@@ -390,8 +315,6 @@ function lotsFromAmount({ amount, ccy='INR', leverage=DEFAULT_LEVERAGE, entryPxU
   const marginUSD   = (ccy.toUpperCase()==='USD') ? amt : (amt / fx);
   const notionalUSD = marginUSD * leverage * (1 - MARGIN_BUFFER_PCT);
   const coins       = notionalUSD / px;
-
-  // coins -> lots/contracts
   const lots        = Math.floor(coins / lotMult);
   return Math.max(1, lots);
 }
@@ -430,118 +353,54 @@ async function learnLotMultFromPositions(psym){
 }
 
 // ---------- order helpers ----------
-async function placeMarketOrderSized({ product_symbol, side, sizeLots, reduce_only=false }){
-  return dcall('POST','/v2/orders',{
-    product_symbol,
-    order_type:'market_order',
-    side,
-    size: sizeLots,
-    ...(reduce_only ? { reduce_only: true } : {})
-  });
-}
-
 async function placeEntry(m){
-  const side = (String(m.side||'').toLowerCase()==='buy') ? 'buy' : 'sell';
+  const side = (m.side||'').toLowerCase()==='buy' ? 'buy' : 'sell';
   const product_symbol = toProductSymbol(m.symbol || m.product_symbol);
 
-  // Determine lotMult (override > cache > meta)
-  let lotMult =
-    getOverrideLotMult(product_symbol) ||
-    getCachedLotMult(product_symbol);
-
+  let lotMult = getCachedLotMult(product_symbol);
   if (!lotMult) {
     const meta = await getProductMeta(product_symbol);
     lotMult = lotMultiplierFromMeta(meta);
     setCachedLotMult(product_symbol, lotMult);
   }
 
-  // leverage can be "10x"
-  const leverage = Math.max(1, Math.floor(nnum(m.leverage || m.leverage_x || DEFAULT_LEVERAGE, DEFAULT_LEVERAGE)));
-
-  // If user passes qty, we respect qty (as lots/contracts)
-  let sizeLots = parseInt(String(m.qty ?? '').replace(/[^0-9-]/g,''), 10);
+  let sizeLots = parseInt(m.qty,10);
   let usedMode = 'qty';
 
-  // Otherwise amount-based sizing
   if (!sizeLots || sizeLots < 1) {
     const fxHint   = nnum(m.fxQuoteToINR || m.fx_quote_to_inr || m.fx || FX_INR_FALLBACK, FX_INR_FALLBACK);
-
-    const ccy      = String(
-      m.amount_ccy || m.ccy ||
-      (typeof m.amount_usd !== 'undefined' ? 'USD' : 'INR')
-    ).toUpperCase();
+    const leverage = Math.max(1, Math.floor(nnum(m.leverage || m.leverage_x || DEFAULT_LEVERAGE, DEFAULT_LEVERAGE)));
+    const ccy      = String(m.amount_ccy || m.ccy || (typeof m.amount_usd !== 'undefined' ? 'USD' : 'INR')).toUpperCase();
 
     let entryPxUSD = nnum(m.entry, 0);
     if (!(entryPxUSD > 0)) entryPxUSD = nnum(await getTickerPriceUSD(product_symbol), 0);
     if (!(entryPxUSD > 0)) throw new Error(`No price available for ${product_symbol}`);
 
-    // Parse amount safely (accept "Rs.2000", "₹2,000")
     let amount = undefined;
     if (typeof m.amount_inr   !== 'undefined') amount = nnum(m.amount_inr, 0);
     else if (typeof m.amount_usd !== 'undefined') amount = nnum(m.amount_usd, 0);
     else if (typeof m.order_amount !== 'undefined') amount = nnum(m.order_amount, 0);
     else if (typeof m.amount !== 'undefined') amount = nnum(m.amount, 0);
-
     if (!(amount > 0)) throw new Error('Amount-based entry requires amount_inr/amount_usd/order_amount/amount');
 
-    sizeLots = lotsFromAmount({
-      amount,
-      ccy,
-      leverage,
-      entryPxUSD,
-      lotMult,
-      fxInrPerUsd: fxHint
-    });
-
+    sizeLots = lotsFromAmount({ amount, ccy, leverage, entryPxUSD, lotMult, fxInrPerUsd: fxHint });
     usedMode = `${ccy==='USD'?'amount_usd':'amount_inr'}`;
   }
 
-  sizeLots = clamp(sizeLots, ENTRY_MIN_LOTS, MAX_LOTS_PER_ORDER);
+  sizeLots = clamp(sizeLots, 1, MAX_LOTS_PER_ORDER);
+  console.log('entry size normalization', { product_symbol, side, lotMult, usedMode, sizeLots });
 
-  console.log('entry size normalization', {
-    product_symbol, side, lotMult, usedMode, sizeLots,
-    leverage: leverage
+  const out = await dcall('POST','/v2/orders',{
+    product_symbol,
+    order_type:'market_order',
+    side,
+    size: sizeLots
   });
 
-  // ✅ NEW: AUTO-DOWNSIZE on insufficient margin
-  let lastErr = null;
-  let trySize = sizeLots;
-
-  for (let attempt = 1; attempt <= Math.max(1, ENTRY_DOWNSIZE_MAX_TRIES); attempt++){
-    try {
-      const out = await placeMarketOrderSized({ product_symbol, side, sizeLots: trySize, reduce_only: false });
-
-      rememberSide(product_symbol, side);
-      LAST_ENTRY_SENT.set(product_symbol, { lots: trySize, ts: Date.now(), side });
-
-      // learn real lot size after fill
-      learnLotMultFromPositions(product_symbol).catch(()=>{});
-
-      return { ...out, _entry_sizing: { usedMode, lotMult, requestedLots: sizeLots, filledAttemptLots: trySize, attempt } };
-
-    } catch(e){
-      lastErr = e;
-
-      if (!ENTRY_AUTO_DOWNSIZE_ON_INSUFF || !looksLikeInsufficient(e)) {
-        throw e;
-      }
-
-      // shrink and retry
-      const nextSize = Math.max(ENTRY_MIN_LOTS, Math.floor(trySize * ENTRY_DOWNSIZE_FACTOR));
-      console.warn('entry insufficient -> downsizing', {
-        product_symbol, attempt, trySize, nextSize, err: String(e?.message || e)
-      });
-
-      if (nextSize >= trySize || nextSize < ENTRY_MIN_LOTS) {
-        break;
-      }
-      trySize = nextSize;
-      await sleep(150);
-    }
-  }
-
-  // still failed
-  throw lastErr || new Error('entry_failed_after_downsize');
+  rememberSide(product_symbol, side);
+  LAST_ENTRY_SENT.set(product_symbol, { lots: sizeLots, ts: Date.now(), side });
+  learnLotMultFromPositions(product_symbol).catch(()=>{});
+  return out;
 }
 
 async function placeBatch(m){
@@ -561,10 +420,7 @@ async function placeBatch(m){
     throw new Error('placeBatch: missing orders[]');
   }
 
-  let lotMult =
-    getOverrideLotMult(psym) ||
-    getCachedLotMult(psym);
-
+  let lotMult = getCachedLotMult(psym);
   if (!lotMult) {
     const meta  = await getProductMeta(psym);
     lotMult = lotMultiplierFromMeta(meta);
@@ -596,7 +452,7 @@ async function placeBatch(m){
       if (!oo.order_type) oo.order_type = 'limit_order';
       if (!oo.limit_price && (oo.price || oo.lmt_price)) oo.limit_price = oo.price || oo.lmt_price;
 
-      oo.size = Math.max(1, parseInt(String(oo.size ?? '').replace(/[^0-9-]/g,''), 10) || 0);
+      oo.size = Math.max(1, parseInt(oo.size, 10) || 0);
       if (!oo.size) throw new Error(`placeBatch: bad size on order #${idx}`);
       if (typeof oo.limit_price !== 'undefined') oo.limit_price = String(oo.limit_price);
 
@@ -740,10 +596,7 @@ async function closePositionBySymbol(symbolOrProductSymbol){
   if (looksLikeLots) {
     lots = Math.max(1, Math.abs(Math.round(rawSize)));
   } else {
-    let lotMult =
-      getOverrideLotMult(psym) ||
-      getCachedLotMult(psym);
-
+    let lotMult = getCachedLotMult(psym);
     if (!lotMult) {
       const meta = await getProductMeta(psym);
       lotMult = lotMultiplierFromMeta(meta);
@@ -829,9 +682,8 @@ async function isFlatNowSymbol(psym){
 }
 
 // ----- Flatten helper for CANCAL (seq0) -----
-// ✅ Updated: defaults to ALL-scope flatten if Pine doesn't specify scope/close_all.
 async function flattenFromCancelMsg(cancelMsg, psym){
-  const scopeAll = isScopeAll(cancelMsg) || (DEFAULT_CANCEL_SCOPE === 'ALL');
+  const scopeAll = isScopeAll(cancelMsg);
 
   // Apply defaults on cancel step ONLY when fields are undefined.
   if (FORCE_CANCEL_ORDERS_ON_CANCEL && typeof cancelMsg.cancel_orders === 'undefined') cancelMsg.cancel_orders = true;
@@ -841,15 +693,7 @@ async function flattenFromCancelMsg(cancelMsg, psym){
   const doClosePos     = (typeof cancelMsg.close_position === 'undefined') ? true : !!cancelMsg.close_position;
 
   const cancelScope = String(
-    cancelMsg.cancel_orders_scope ||
-    cancelMsg.scope ||
-    (scopeAll ? 'ALL' : 'SYMBOL')
-  ).toUpperCase();
-
-  const closeScope = String(
-    cancelMsg.close_position_scope ||
-    cancelMsg.scope ||
-    (scopeAll ? 'ALL' : 'SYMBOL')
+    cancelMsg.cancel_orders_scope || (scopeAll ? 'ALL' : 'SYMBOL')
   ).toUpperCase();
 
   const cancelFallbackAll = !!cancelMsg.cancel_fallback_all;
@@ -881,7 +725,7 @@ async function flattenFromCancelMsg(cancelMsg, psym){
 
   if (doClosePos) {
     try {
-      if (scopeAll || closeScope === 'ALL') {
+      if (scopeAll) {
         await closeAllPositions();
         steps.close_mode = 'close_all_positions';
       } else {
@@ -915,10 +759,6 @@ async function preflightFromEnterMsg(enterMsg, psym){
     enterMsg.cancel_orders_scope || (scopeAll ? 'ALL' : 'SYMBOL')
   ).toUpperCase();
 
-  const closeScope = String(
-    enterMsg.close_position_scope || enterMsg.scope || (scopeAll ? 'ALL' : 'SYMBOL')
-  ).toUpperCase();
-
   const cancelFallbackAll = !!enterMsg.cancel_fallback_all;
 
   const steps = {
@@ -948,7 +788,7 @@ async function preflightFromEnterMsg(enterMsg, psym){
 
   if (doClosePos) {
     try {
-      if (scopeAll || closeScope === 'ALL') {
+      if (scopeAll) {
         await closeAllPositions();
         steps.close_mode = 'close_all_positions';
       } else {
@@ -1048,13 +888,7 @@ app.post('/tv', async (req, res) => {
       if (!chain.didCancel) {
         if (chain.cancelMsg) {
           const cancelMsg = chain.cancelMsg;
-
-          // ✅ default to ALL cancel on seq0 if not specified (new behavior)
-          if (typeof cancelMsg.cancel_orders_scope === 'undefined' && typeof cancelMsg.scope === 'undefined' && typeof cancelMsg.close_all === 'undefined') {
-            cancelMsg.cancel_orders_scope = DEFAULT_CANCEL_SCOPE; // ALL by default
-            cancelMsg.scope = DEFAULT_CANCEL_SCOPE;
-            if (DEFAULT_CANCEL_SCOPE === 'ALL') cancelMsg.close_all = true;
-          }
+          if (typeof cancelMsg.cancel_orders_scope === 'undefined') cancelMsg.cancel_orders_scope = 'SYMBOL';
 
           const steps = await flattenFromCancelMsg(cancelMsg, psym);
 
@@ -1072,9 +906,7 @@ app.post('/tv', async (req, res) => {
         } else {
           // If AUTO_CANCEL_ON_ENTER is enabled, we can synthesize a cancel from ENTER.
           if (AUTO_CANCEL_ON_ENTER && chain.enterMsg) {
-            const syntheticCancel = { ...chain.enterMsg, action:'CANCAL', seq:0, cancel_orders_scope: DEFAULT_CANCEL_SCOPE, scope: DEFAULT_CANCEL_SCOPE };
-            if (DEFAULT_CANCEL_SCOPE === 'ALL') syntheticCancel.close_all = true;
-
+            const syntheticCancel = { ...chain.enterMsg, action:'CANCAL', seq:0, cancel_orders_scope:'SYMBOL' };
             const steps = await flattenFromCancelMsg(syntheticCancel, psym);
             const flat = isScopeAll(syntheticCancel) ? await waitUntilFlat() : await waitUntilFlatSymbol(psym);
 
@@ -1083,6 +915,7 @@ app.post('/tv', async (req, res) => {
             progressed.push({ ok:true, did:'CANCAL', synthetic:true, steps, flat, symbol: psym });
           } else {
             // ✅ To avoid stalling when Pine disables CANCAL, allow progression if ENTER exists.
+            // ENTER step will do the cancel/close per Pine flags anyway.
             if (chain.enterMsg) {
               chain.didCancel = true;
               if (STRICT_SEQUENCE) setSigState(sigId, psym, { lastSeq: 0 });
@@ -1123,14 +956,10 @@ app.post('/tv', async (req, res) => {
           progressed.push({ ok:true, did:'ENTER_PRE', pre, symbol: psym });
         }
 
-        // ✅ small settle delay after flatten/preflight
-        if (ENTER_POST_CANCEL_DELAY_MS > 0) await sleep(ENTER_POST_CANCEL_DELAY_MS);
-
-        // ✅ UPDATED DEFAULT: allow immediate entry unless Pine explicitly requires flat
-        const requireFlat =
-          (typeof enterMsg.require_flat === 'undefined') ? ENTER_REQUIRE_FLAT_DEFAULT : !!enterMsg.require_flat;
+        const requireFlat = (typeof enterMsg.require_flat === 'undefined') ? true : !!enterMsg.require_flat;
 
         if (requireFlat) {
+          // quick check
           const flatNow = isScopeAll(enterMsg) ? await isFlatNowGlobal() : await isFlatNowSymbol(psym);
 
           if (!flatNow) {
@@ -1207,5 +1036,6 @@ app.post('/tv', async (req, res) => {
 });
 
 app.listen(PORT, ()=>console.log(
-  `Relay listening http://localhost:${PORT} (BASE=${BASE_URL}, AUTH=${AUTH_MODE}, STRICT_SEQUENCE=${STRICT_SEQUENCE}, FAST_ENTER=${FAST_ENTER}, SIGNAL_CHAIN_WINDOW_MS=${SIGNAL_CHAIN_WINDOW_MS}, AUTO_CANCEL_ON_ENTER=${AUTO_CANCEL_ON_ENTER}, DEFAULT_CANCEL_SCOPE=${DEFAULT_CANCEL_SCOPE}, ENTER_REQUIRE_FLAT_DEFAULT=${ENTER_REQUIRE_FLAT_DEFAULT}, ENTER_POST_CANCEL_DELAY_MS=${ENTER_POST_CANCEL_DELAY_MS}, FORCE_CLOSE_ON_CANCEL=${FORCE_CLOSE_ON_CANCEL}, ENTRY_AUTO_DOWNSIZE_ON_INSUFF=${ENTRY_AUTO_DOWNSIZE_ON_INSUFF}, ENTRY_DOWNSIZE_MAX_TRIES=${ENTRY_DOWNSIZE_MAX_TRIES})`
+  `Relay listening http://localhost:${PORT} (BASE=${BASE_URL}, AUTH=${AUTH_MODE}, STRICT_SEQUENCE=${STRICT_SEQUENCE}, FAST_ENTER=${FAST_ENTER}, SIGNAL_CHAIN_WINDOW_MS=${SIGNAL_CHAIN_WINDOW_MS}, AUTO_CANCEL_ON_ENTER=${AUTO_CANCEL_ON_ENTER}, FORCE_CLOSE_ON_CANCEL=${FORCE_CLOSE_ON_CANCEL})`
 ));
+

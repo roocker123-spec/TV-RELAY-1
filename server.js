@@ -1,12 +1,12 @@
 // server.js (FULL) — PER-SYMBOL queue/lock, sig_id+seq idempotency,
 // STRICT sequencing: expects CANCAL(seq0) -> ENTER(seq1) -> BATCH_TPS(seq2)
 //
-// ✅ THIS VERSION MATCHES YOUR PINE PAYLOADS:
-// - CANCAL(seq0): typically cancel_orders=true, close_position=false  (your Pine does this)
-// - ENTER(seq1): cancel_orders=true, close_position=true, require_flat=true (your Pine does this)
-// - BATCH_TPS(seq2): places TP batch
+// ✅ THIS VERSION ADDS YOUR REQUESTED UPDATE:
+// - When a CANCEL runs, it cancels ALL pending/open NEAR (or symbol) orders across ALL pages.
+// - Adds a "cancel cutoff" so CANCEL won’t accidentally cancel NEW TP orders created AFTER cancel started.
+//   (You can override with msg.cancel_include_new=true to drain *everything*, including new orders created mid-cancel.)
 //
-// ✅ FIXES INCLUDED:
+// ✅ FIXES INCLUDED (from your prior version):
 // 1) Chain draining: out-of-order arrival still progresses cancel -> enter -> batch using buffered msgs.
 // 2) ENTER preflight: does cancel/close (if flags true) BEFORE waiting flat and entering.
 // 3) Position closing fix: Delta position size often is LOTS/contracts (e.g., -4 IP).
@@ -184,7 +184,7 @@ function getChain(sigId, psym){
       enterMsg: null,
       batchMsg: null,
       didCancel: false,
-      didEnterPrep: false, // ✅ new: prevents repeated cancel/close preflight if entry step retries
+      didEnterPrep: false, // ✅ prevents repeated cancel/close preflight if entry step retries
       didEnter: false,
       didBatch: false
     };
@@ -500,11 +500,21 @@ async function cancelOrder({ id, client_order_id, product_id, product_symbol }){
   return dcall('DELETE', '/v2/orders', payload);
 }
 
+// ✅ Parse order timestamps robustly (Delta fields can vary)
+function orderCreatedMs(o){
+  const cand = o?.created_at || o?.createdAt || o?.created_time || o?.createdTime || o?.timestamp || null;
+  if (!cand) return null;
+  const t = Date.parse(cand);
+  return Number.isFinite(t) ? t : null;
+}
+
+// ✅ list ALL pages, include pending/open states
 async function listOpenOrdersAllPages(){
   let all = [];
   let page = 1;
   while (true){
-    const q = `?states=open,pending&page=${page}&per_page=200`;
+    // Keep the states broad; Delta uses different states depending on order type.
+    const q = `?states=open,pending,triggered,untriggered&page=${page}&per_page=200`;
     const oo = await dcall('GET','/v2/orders', null, q);
     const arr = Array.isArray(oo?.result) ? oo.result
               : Array.isArray(oo?.orders) ? oo.orders
@@ -516,41 +526,78 @@ async function listOpenOrdersAllPages(){
   return all;
 }
 
-async function cancelOrdersBySymbol(psym, { fallbackAll=false } = {}){
+/**
+ * ✅ Cancel ALL open/pending orders for a symbol across ALL pages.
+ * ✅ "Drain" mode: repeats list+cancel until none remain (or pass limit hit).
+ * ✅ Cutoff protection: if cutoffMs is set, only cancel orders created <= cutoffMs.
+ *    This prevents CANCEL from wiping NEW TP orders created *after* CANCEL began.
+ *
+ * Options:
+ * - fallbackAll: if canceling individual orders fails, do cancelAllOrders()
+ * - cutoffMs: number | null (use Date.now() at start of CANCEL unless cancel_include_new)
+ * - drainPasses: max repeat passes (default 3)
+ */
+async function cancelOrdersBySymbol(psym, { fallbackAll=false, cutoffMs=null, drainPasses=3 } = {}){
   const sym = toProductSymbol(psym);
   if (!sym) return { ok:true, skipped:true, reason:'missing_symbol' };
 
-  let open = [];
-  try { open = await listOpenOrdersAllPages(); }
-  catch(e) {
-    if (fallbackAll) { await cancelAllOrders(); return { ok:true, fallback:'cancel_all_orders' }; }
-    throw e;
-  }
+  let totalCancelled = 0;
+  let totalFailed = 0;
+  let passes = 0;
 
-  const mine = open.filter(o => safeUpper(o?.product_symbol||o?.symbol) === safeUpper(sym));
-  if (!mine.length) return { ok:true, skipped:true, reason:'no_open_orders_for_symbol', symbol: sym };
+  while (passes < Math.max(1, drainPasses)) {
+    passes++;
 
-  let cancelled = 0, failed = 0;
-  for (const o of mine){
-    const oid = o?.id ?? o?.order_id;
-    const pid = o?.product_id;
-    const coid = o?.client_order_id;
-
-    try {
-      await cancelOrder({ id: oid, client_order_id: coid, product_id: pid, product_symbol: sym });
-      cancelled++;
-    } catch(e){
-      failed++;
-      console.warn('cancelOrdersBySymbol: cancel failed', { symbol: sym, oid, pid, err: e?.message || e });
+    let open = [];
+    try { open = await listOpenOrdersAllPages(); }
+    catch(e) {
+      if (fallbackAll) { await cancelAllOrders(); return { ok:true, fallback:'cancel_all_orders' }; }
+      throw e;
     }
+
+    let mine = open.filter(o => safeUpper(o?.product_symbol||o?.symbol) === safeUpper(sym));
+
+    // ✅ cutoff filter (optional)
+    if (cutoffMs && Number.isFinite(cutoffMs)) {
+      mine = mine.filter(o => {
+        const ms = orderCreatedMs(o);
+        // If no timestamp exists, assume "old" and cancel it (safer).
+        if (!ms) return true;
+        return ms <= cutoffMs;
+      });
+    }
+
+    if (!mine.length) break;
+
+    let cancelledThisPass = 0;
+    for (const o of mine){
+      const oid  = o?.id ?? o?.order_id;
+      const pid  = o?.product_id;
+      const coid = o?.client_order_id;
+
+      try {
+        await cancelOrder({ id: oid, client_order_id: coid, product_id: pid, product_symbol: sym });
+        cancelledThisPass++;
+        totalCancelled++;
+      } catch(e){
+        totalFailed++;
+        console.warn('cancelOrdersBySymbol: cancel failed', { symbol: sym, oid, pid, err: e?.message || e });
+      }
+    }
+
+    // If we made no progress, stop draining
+    if (cancelledThisPass === 0) break;
+
+    // tiny pause so Delta order state updates propagate before next pass
+    await sleep(150);
   }
 
-  if (failed && fallbackAll) {
+  if (totalFailed && fallbackAll) {
     await cancelAllOrders();
-    return { ok:true, cancelled, failed, fallback:'cancel_all_orders' };
+    return { ok:true, cancelled: totalCancelled, failed: totalFailed, passes, fallback:'cancel_all_orders' };
   }
 
-  return { ok:true, cancelled, failed, symbol: sym };
+  return { ok:true, cancelled: totalCancelled, failed: totalFailed, passes, symbol: sym, cutoffMs };
 }
 
 async function listPositionsArray(){
@@ -698,13 +745,21 @@ async function flattenFromCancelMsg(cancelMsg, psym){
 
   const cancelFallbackAll = !!cancelMsg.cancel_fallback_all;
 
+  // ✅ new: cutoff behavior
+  // By default: cancel orders that existed when CANCEL started (prevents wiping new TP orders).
+  // If you truly want "cancel anything that appears while canceling", send cancel_include_new=true.
+  const cancelIncludeNew = !!cancelMsg.cancel_include_new;
+  const cutoffMs = cancelIncludeNew ? null : Date.now();
+
   const steps = {
     cancel_orders: false,
     close_position: false,
     cancel_mode: null,
     close_mode: null,
     cancel_error: null,
-    close_error: null
+    close_error: null,
+    cancel_cutoff_ms: cutoffMs,
+    cancel_include_new: cancelIncludeNew
   };
 
   if (doCancelOrders) {
@@ -713,8 +768,9 @@ async function flattenFromCancelMsg(cancelMsg, psym){
         await cancelAllOrders();
         steps.cancel_mode = 'cancel_all_orders';
       } else {
-        await cancelOrdersBySymbol(psym, { fallbackAll: cancelFallbackAll });
-        steps.cancel_mode = 'cancel_symbol_orders';
+        // ✅ drains across ALL pages; cancel cutoff avoids canceling new TP orders
+        await cancelOrdersBySymbol(psym, { fallbackAll: cancelFallbackAll, cutoffMs, drainPasses: 5 });
+        steps.cancel_mode = 'cancel_symbol_orders_drain';
       }
       steps.cancel_orders = true;
     } catch (e) {
@@ -761,13 +817,19 @@ async function preflightFromEnterMsg(enterMsg, psym){
 
   const cancelFallbackAll = !!enterMsg.cancel_fallback_all;
 
+  // ✅ new: cutoff behavior also on ENTER-preflight cancel
+  const cancelIncludeNew = !!enterMsg.cancel_include_new;
+  const cutoffMs = cancelIncludeNew ? null : Date.now();
+
   const steps = {
     cancel_orders: false,
     close_position: false,
     cancel_mode: null,
     close_mode: null,
     cancel_error: null,
-    close_error: null
+    close_error: null,
+    cancel_cutoff_ms: cutoffMs,
+    cancel_include_new: cancelIncludeNew
   };
 
   if (doCancelOrders) {
@@ -776,8 +838,8 @@ async function preflightFromEnterMsg(enterMsg, psym){
         await cancelAllOrders();
         steps.cancel_mode = 'cancel_all_orders';
       } else {
-        await cancelOrdersBySymbol(psym, { fallbackAll: cancelFallbackAll });
-        steps.cancel_mode = 'cancel_symbol_orders';
+        await cancelOrdersBySymbol(psym, { fallbackAll: cancelFallbackAll, cutoffMs, drainPasses: 5 });
+        steps.cancel_mode = 'cancel_symbol_orders_drain';
       }
       steps.cancel_orders = true;
     } catch (e) {
@@ -1038,4 +1100,3 @@ app.post('/tv', async (req, res) => {
 app.listen(PORT, ()=>console.log(
   `Relay listening http://localhost:${PORT} (BASE=${BASE_URL}, AUTH=${AUTH_MODE}, STRICT_SEQUENCE=${STRICT_SEQUENCE}, FAST_ENTER=${FAST_ENTER}, SIGNAL_CHAIN_WINDOW_MS=${SIGNAL_CHAIN_WINDOW_MS}, AUTO_CANCEL_ON_ENTER=${AUTO_CANCEL_ON_ENTER}, FORCE_CLOSE_ON_CANCEL=${FORCE_CLOSE_ON_CANCEL})`
 ));
-

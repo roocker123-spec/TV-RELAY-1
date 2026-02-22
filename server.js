@@ -1,19 +1,18 @@
 // server.js (FULL) — PER-SYMBOL queue/lock, sig_id+seq idempotency,
 // STRICT sequencing: expects CANCAL(seq0) -> ENTER(seq1) -> BATCH_TPS(seq2)
 //
-// ✅ WHAT THIS VERSION GUARANTEES (your exact requirement):
-// 1) Always executes in order: CANCEL -> ENTER -> BATCH (never ENTER->CANCEL->BATCH).
-// 2) CANCEL/FLATTEN is ALWAYS for the SAME SYMBOL whose alert fired.
-// 3) CANCEL cancels ALL existing/pending/open orders + closes open position for that symbol,
-//    BUT protects NEW orders created AFTER cancel started (so it won't wipe fresh TP orders).
-//    (Override per message: cancel_include_new=true to drain everything including new orders)
+// ✅ THIS VERSION MATCHES YOUR PINE PAYLOADS:
+// - CANCAL(seq0): typically cancel_orders=true, close_position=false  (your Pine does this)
+// - ENTER(seq1): cancel_orders=true, close_position=true, require_flat=true (your Pine does this)
+// - BATCH_TPS(seq2): places TP batch
 //
-// ✅ ALSO:
-// - If Pine doesn't send seq0 (CANCAL), ENTER will still do a preflight cancel+close BEFORE entry.
-// - Cancels across ALL pages.
-// - Broader states to avoid “works for some coins only” issues.
+// ✅ FIXES INCLUDED:
+// 1) Chain draining: out-of-order arrival still progresses cancel -> enter -> batch using buffered msgs.
+// 2) ENTER preflight: does cancel/close (if flags true) BEFORE waiting flat and entering.
+// 3) Position closing fix: Delta position size often is LOTS/contracts (e.g., -4 IP).
+//    We detect that and close using lots directly.
 //
-// ⚠️ Cloud Run: Max instances = 1 (and ideally concurrency = 1) OR store state in Redis/Firestore.
+// ⚠️ Cloud Run: Use Max instances = 1 (and ideally concurrency = 1) OR store state in Redis/Firestore.
 
 require('dotenv').config();
 const express = require('express');
@@ -106,7 +105,7 @@ const STRICT_SEQUENCE = String(process.env.STRICT_SEQUENCE || 'true').toLowerCas
 // ✅ chain window to ensure "same bar burst" (default 15s)
 const SIGNAL_CHAIN_WINDOW_MS = nnum(process.env.SIGNAL_CHAIN_WINDOW_MS, 15_000);
 
-// If true, ENTER could synthesize cancel. Keep false; we already do preflight cancel before entry.
+// If true, ENTER could synthesize cancel. Usually keep false.
 const AUTO_CANCEL_ON_ENTER = String(process.env.AUTO_CANCEL_ON_ENTER || 'false').toLowerCase() === 'true';
 
 // Defaults for cancel step ONLY (applied only when undefined on the incoming message)
@@ -185,7 +184,7 @@ function getChain(sigId, psym){
       enterMsg: null,
       batchMsg: null,
       didCancel: false,
-      didEnterPrep: false, // prevents repeated preflight if entry step retries
+      didEnterPrep: false, // ✅ new: prevents repeated cancel/close preflight if entry step retries
       didEnter: false,
       didBatch: false
     };
@@ -501,20 +500,11 @@ async function cancelOrder({ id, client_order_id, product_id, product_symbol }){
   return dcall('DELETE', '/v2/orders', payload);
 }
 
-// ✅ Parse order timestamps robustly (Delta fields can vary)
-function orderCreatedMs(o){
-  const cand = o?.created_at || o?.createdAt || o?.created_time || o?.createdTime || o?.timestamp || null;
-  if (!cand) return null;
-  const t = Date.parse(cand);
-  return Number.isFinite(t) ? t : null;
-}
-
-// ✅ list ALL pages, include pending/open-like states (fixes “some coins” problems)
 async function listOpenOrdersAllPages(){
   let all = [];
   let page = 1;
   while (true){
-    const q = `?states=open,pending,new,partially_filled,triggered,untriggered&page=${page}&per_page=200`;
+    const q = `?states=open,pending&page=${page}&per_page=200`;
     const oo = await dcall('GET','/v2/orders', null, q);
     const arr = Array.isArray(oo?.result) ? oo.result
               : Array.isArray(oo?.orders) ? oo.orders
@@ -526,76 +516,41 @@ async function listOpenOrdersAllPages(){
   return all;
 }
 
-/**
- * Cancel ALL open/pending orders for a symbol across ALL pages.
- * Drain mode: repeats list+cancel until none remain (or pass limit hit).
- * Cutoff protection: if cutoffMs is set, only cancel orders created <= cutoffMs.
- * This prevents CANCEL from wiping NEW TP orders created AFTER cancel started.
- *
- * Options:
- * - fallbackAll: if canceling individual orders fails, do cancelAllOrders()
- * - cutoffMs: number | null
- * - drainPasses: max repeat passes (default 5)
- */
-async function cancelOrdersBySymbol(psym, { fallbackAll=false, cutoffMs=null, drainPasses=5 } = {}){
+async function cancelOrdersBySymbol(psym, { fallbackAll=false } = {}){
   const sym = toProductSymbol(psym);
   if (!sym) return { ok:true, skipped:true, reason:'missing_symbol' };
 
-  let totalCancelled = 0;
-  let totalFailed = 0;
-  let passes = 0;
-
-  while (passes < Math.max(1, drainPasses)) {
-    passes++;
-
-    let open = [];
-    try { open = await listOpenOrdersAllPages(); }
-    catch(e) {
-      if (fallbackAll) { await cancelAllOrders(); return { ok:true, fallback:'cancel_all_orders' }; }
-      throw e;
-    }
-
-    let mine = open.filter(o => safeUpper(o?.product_symbol||o?.symbol) === safeUpper(sym));
-
-    // ✅ cutoff filter (default ON) — cancels only "older/existing" orders before cancel started
-    if (cutoffMs && Number.isFinite(cutoffMs)) {
-      mine = mine.filter(o => {
-        const ms = orderCreatedMs(o);
-        // If no timestamp exists, assume "old" and cancel it (safer).
-        if (!ms) return true;
-        return ms <= cutoffMs;
-      });
-    }
-
-    if (!mine.length) break;
-
-    let cancelledThisPass = 0;
-    for (const o of mine){
-      const oid  = o?.id ?? o?.order_id;
-      const pid  = o?.product_id;
-      const coid = o?.client_order_id;
-
-      try {
-        await cancelOrder({ id: oid, client_order_id: coid, product_id: pid, product_symbol: sym });
-        cancelledThisPass++;
-        totalCancelled++;
-      } catch(e){
-        totalFailed++;
-        console.warn('cancelOrdersBySymbol: cancel failed', { symbol: sym, oid, pid, err: e?.message || e });
-      }
-    }
-
-    if (cancelledThisPass === 0) break;
-
-    await sleep(150);
+  let open = [];
+  try { open = await listOpenOrdersAllPages(); }
+  catch(e) {
+    if (fallbackAll) { await cancelAllOrders(); return { ok:true, fallback:'cancel_all_orders' }; }
+    throw e;
   }
 
-  if (totalFailed && fallbackAll) {
+  const mine = open.filter(o => safeUpper(o?.product_symbol||o?.symbol) === safeUpper(sym));
+  if (!mine.length) return { ok:true, skipped:true, reason:'no_open_orders_for_symbol', symbol: sym };
+
+  let cancelled = 0, failed = 0;
+  for (const o of mine){
+    const oid = o?.id ?? o?.order_id;
+    const pid = o?.product_id;
+    const coid = o?.client_order_id;
+
+    try {
+      await cancelOrder({ id: oid, client_order_id: coid, product_id: pid, product_symbol: sym });
+      cancelled++;
+    } catch(e){
+      failed++;
+      console.warn('cancelOrdersBySymbol: cancel failed', { symbol: sym, oid, pid, err: e?.message || e });
+    }
+  }
+
+  if (failed && fallbackAll) {
     await cancelAllOrders();
-    return { ok:true, cancelled: totalCancelled, failed: totalFailed, passes, fallback:'cancel_all_orders' };
+    return { ok:true, cancelled, failed, fallback:'cancel_all_orders' };
   }
 
-  return { ok:true, cancelled: totalCancelled, failed: totalFailed, passes, symbol: sym, cutoffMs };
+  return { ok:true, cancelled, failed, symbol: sym };
 }
 
 async function listPositionsArray(){
@@ -668,7 +623,7 @@ async function waitUntilFlat(timeoutMs = FLAT_TIMEOUT_MS, pollMs = FLAT_POLL_MS)
   while (Date.now() < end) {
     try {
       const oo  = await listOpenOrdersAllPages();
-      const hasOrders = oo.some(o => ['open','pending','new','partially_filled','triggered','untriggered']
+      const hasOrders = oo.some(o => ['open','pending','triggered','untriggered']
         .includes(String(o?.state||o?.status||'').toLowerCase()));
       const pos = await listPositionsArray();
       const hasPos = pos.some(p => Math.abs(Number(p?.size||p?.position_size||0)) > 0);
@@ -686,7 +641,7 @@ async function waitUntilFlatSymbol(psym, timeoutMs = FLAT_TIMEOUT_MS, pollMs = F
     try {
       const oo  = await listOpenOrdersAllPages();
       const mineOrders = oo.filter(o => safeUpper(o?.product_symbol||o?.symbol) === safeUpper(sym));
-      const hasOrders = mineOrders.some(o => ['open','pending','new','partially_filled','triggered','untriggered']
+      const hasOrders = mineOrders.some(o => ['open','pending','triggered','untriggered']
         .includes(String(o?.state||o?.status||'').toLowerCase()));
 
       const pos = await listPositionsArray();
@@ -703,7 +658,7 @@ async function waitUntilFlatSymbol(psym, timeoutMs = FLAT_TIMEOUT_MS, pollMs = F
 async function isFlatNowGlobal(){
   try {
     const oo  = await listOpenOrdersAllPages();
-    const hasOrders = oo.some(o => ['open','pending','new','partially_filled','triggered','untriggered']
+    const hasOrders = oo.some(o => ['open','pending','triggered','untriggered']
       .includes(String(o?.state||o?.status||'').toLowerCase()));
     const pos = await listPositionsArray();
     const hasPos = pos.some(p => Math.abs(Number(p?.size||p?.position_size||0)) > 0);
@@ -715,7 +670,7 @@ async function isFlatNowSymbol(psym){
   try {
     const oo  = await listOpenOrdersAllPages();
     const mineOrders = oo.filter(o => safeUpper(o?.product_symbol||o?.symbol) === safeUpper(sym));
-    const hasOrders = mineOrders.some(o => ['open','pending','new','partially_filled','triggered','untriggered']
+    const hasOrders = mineOrders.some(o => ['open','pending','triggered','untriggered']
       .includes(String(o?.state||o?.status||'').toLowerCase()));
 
     const pos = await listPositionsArray();
@@ -743,21 +698,13 @@ async function flattenFromCancelMsg(cancelMsg, psym){
 
   const cancelFallbackAll = !!cancelMsg.cancel_fallback_all;
 
-  // ✅ THIS IS THE KEY for your request:
-  // Default: cancel ONLY orders that existed when cancel started (older/existing),
-  // so it will NOT cancel new TP orders created after cancel began.
-  const cancelIncludeNew = !!cancelMsg.cancel_include_new; // if true -> cancels even new orders created mid-cancel
-  const cutoffMs = cancelIncludeNew ? null : Date.now();
-
   const steps = {
     cancel_orders: false,
     close_position: false,
     cancel_mode: null,
     close_mode: null,
     cancel_error: null,
-    close_error: null,
-    cancel_cutoff_ms: cutoffMs,
-    cancel_include_new: cancelIncludeNew
+    close_error: null
   };
 
   if (doCancelOrders) {
@@ -766,8 +713,8 @@ async function flattenFromCancelMsg(cancelMsg, psym){
         await cancelAllOrders();
         steps.cancel_mode = 'cancel_all_orders';
       } else {
-        await cancelOrdersBySymbol(psym, { fallbackAll: cancelFallbackAll, cutoffMs, drainPasses: 6 });
-        steps.cancel_mode = 'cancel_symbol_orders_drain';
+        await cancelOrdersBySymbol(psym, { fallbackAll: cancelFallbackAll });
+        steps.cancel_mode = 'cancel_symbol_orders';
       }
       steps.cancel_orders = true;
     } catch (e) {
@@ -801,14 +748,12 @@ async function flattenFromCancelMsg(cancelMsg, psym){
   return steps;
 }
 
-// ----- Preflight helper for ENTER (seq1) — ALWAYS flatten symbol BEFORE entry -----
+// ----- Preflight helper for ENTER (seq1) — matches Pine ENTER cancel/close flags -----
 async function preflightFromEnterMsg(enterMsg, psym){
   const scopeAll = isScopeAll(enterMsg);
 
-  // ✅ IMPORTANT: default TRUE so if ENTER fires, we flatten that coin first.
-  // You can override by sending cancel_orders=false / close_position=false.
-  const doCancelOrders = (typeof enterMsg.cancel_orders === 'undefined') ? true : !!enterMsg.cancel_orders;
-  const doClosePos     = (typeof enterMsg.close_position === 'undefined') ? true : !!enterMsg.close_position;
+  const doCancelOrders = !!enterMsg.cancel_orders;
+  const doClosePos     = !!enterMsg.close_position;
 
   const cancelScope = String(
     enterMsg.cancel_orders_scope || (scopeAll ? 'ALL' : 'SYMBOL')
@@ -816,19 +761,13 @@ async function preflightFromEnterMsg(enterMsg, psym){
 
   const cancelFallbackAll = !!enterMsg.cancel_fallback_all;
 
-  // ✅ Default cutoff protection ON (same as cancel step)
-  const cancelIncludeNew = !!enterMsg.cancel_include_new;
-  const cutoffMs = cancelIncludeNew ? null : Date.now();
-
   const steps = {
     cancel_orders: false,
     close_position: false,
     cancel_mode: null,
     close_mode: null,
     cancel_error: null,
-    close_error: null,
-    cancel_cutoff_ms: cutoffMs,
-    cancel_include_new: cancelIncludeNew
+    close_error: null
   };
 
   if (doCancelOrders) {
@@ -837,8 +776,8 @@ async function preflightFromEnterMsg(enterMsg, psym){
         await cancelAllOrders();
         steps.cancel_mode = 'cancel_all_orders';
       } else {
-        await cancelOrdersBySymbol(psym, { fallbackAll: cancelFallbackAll, cutoffMs, drainPasses: 6 });
-        steps.cancel_mode = 'cancel_symbol_orders_drain';
+        await cancelOrdersBySymbol(psym, { fallbackAll: cancelFallbackAll });
+        steps.cancel_mode = 'cancel_symbol_orders';
       }
       steps.cancel_orders = true;
     } catch (e) {
@@ -975,12 +914,12 @@ app.post('/tv', async (req, res) => {
             if (STRICT_SEQUENCE) setSigState(sigId, psym, { lastSeq: 0 });
             progressed.push({ ok:true, did:'CANCAL', synthetic:true, steps, flat, symbol: psym });
           } else {
-            // ✅ To avoid stalling when Pine doesn't send seq0, allow progression
-            // BUT we still do ENTER preflight cancel+close BEFORE entry.
+            // ✅ To avoid stalling when Pine disables CANCAL, allow progression if ENTER exists.
+            // ENTER step will do the cancel/close per Pine flags anyway.
             if (chain.enterMsg) {
               chain.didCancel = true;
               if (STRICT_SEQUENCE) setSigState(sigId, psym, { lastSeq: 0 });
-              progressed.push({ ok:true, did:'CANCAL', skipped:true, note:'No seq0 received; proceeding because ENTER exists (ENTER preflight will flatten)', symbol: psym });
+              progressed.push({ ok:true, did:'CANCAL', skipped:true, note:'No seq0 received; proceeding because ENTER exists', symbol: psym });
             } else {
               return {
                 ok:true,
@@ -1010,7 +949,7 @@ app.post('/tv', async (req, res) => {
 
         const enterMsg = chain.enterMsg;
 
-        // ✅ ALWAYS flatten symbol BEFORE entry (this ensures CANCEL->ENTER, not ENTER->CANCEL)
+        // ✅ MATCH PINE: ENTER can cancel_orders & close_position BEFORE entry.
         if (!chain.didEnterPrep) {
           const pre = await preflightFromEnterMsg(enterMsg, psym);
           chain.didEnterPrep = true;
@@ -1020,6 +959,7 @@ app.post('/tv', async (req, res) => {
         const requireFlat = (typeof enterMsg.require_flat === 'undefined') ? true : !!enterMsg.require_flat;
 
         if (requireFlat) {
+          // quick check
           const flatNow = isScopeAll(enterMsg) ? await isFlatNowGlobal() : await isFlatNowSymbol(psym);
 
           if (!flatNow) {
@@ -1098,3 +1038,4 @@ app.post('/tv', async (req, res) => {
 app.listen(PORT, ()=>console.log(
   `Relay listening http://localhost:${PORT} (BASE=${BASE_URL}, AUTH=${AUTH_MODE}, STRICT_SEQUENCE=${STRICT_SEQUENCE}, FAST_ENTER=${FAST_ENTER}, SIGNAL_CHAIN_WINDOW_MS=${SIGNAL_CHAIN_WINDOW_MS}, AUTO_CANCEL_ON_ENTER=${AUTO_CANCEL_ON_ENTER}, FORCE_CLOSE_ON_CANCEL=${FORCE_CLOSE_ON_CANCEL})`
 ));
+

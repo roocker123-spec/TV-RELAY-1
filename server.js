@@ -2,15 +2,15 @@
 // STRICT sequencing: expects CANCAL(seq0) -> ENTER(seq1) -> BATCH_TPS(seq2)
 //
 // ✅ THIS VERSION MATCHES YOUR PINE PAYLOADS:
-// - CANCAL(seq0): typically cancel_orders=true, close_position=false  (your Pine does this)
-// - ENTER(seq1): cancel_orders=true, close_position=true, require_flat=true (your Pine does this)
+// - CANCAL(seq0): typically cancel_orders=true, close_position=false
+// - ENTER(seq1): cancel_orders=true, close_position=true, require_flat=true
 // - BATCH_TPS(seq2): places TP batch
 //
-// ✅ FIXES INCLUDED:
-// 1) Chain draining: out-of-order arrival still progresses cancel -> enter -> batch using buffered msgs.
-// 2) ENTER preflight: does cancel/close (if flags true) BEFORE waiting flat and entering.
-// 3) Position closing fix: Delta position size often is LOTS/contracts (e.g., -4 IP).
-//    We detect that and close using lots directly.
+// ✅ FIXES INCLUDED (DYNAMIC LOT MULT ACROSS ALL COINS):
+// 1) Dynamic coins-per-lot (lotMult) for ANY symbol:
+//    - cache -> /v2/products meta -> fallback 1
+// 2) Safer lotMult meta picking (prioritizes lot_size/contract_size)
+// 3) Learning fallback improved (learn coinsPerLot from positions)
 //
 // ⚠️ Cloud Run: Use Max instances = 1 (and ideally concurrency = 1) OR store state in Redis/Firestore.
 
@@ -184,7 +184,7 @@ function getChain(sigId, psym){
       enterMsg: null,
       batchMsg: null,
       didCancel: false,
-      didEnterPrep: false, // ✅ new: prevents repeated cancel/close preflight if entry step retries
+      didEnterPrep: false, // prevents repeated cancel/close preflight if entry step retries
       didEnter: false,
       didBatch: false
     };
@@ -275,22 +275,59 @@ async function getProductIdBySymbol(psym){
 }
 
 const LOT_MULT_CACHE = new Map(); // product_symbol -> { m, ts }
-function lotMultiplierFromMeta(meta){
-  const cand = [
-    meta?.contract_value,
-    meta?.contract_size,
-    meta?.lot_size,
-    meta?.contract_unit,
-    meta?.qty_step
-  ].map(n => Number.isFinite(+n) ? +n : NaN).filter(n => n && n > 0);
 
-  const ints = cand.filter(n => Math.abs(n - Math.round(n)) < 1e-6);
-  let m = (ints.length ? Math.max(...ints) : (cand.length ? Math.max(...cand) : 1));
-  if (!Number.isFinite(m) || m < 1) m = 1;
-  return Math.round(m);
+// ✅ UPDATED: safer meta selection for "coins per 1 lot"
+function lotMultiplierFromMeta(meta){
+  // Prefer fields that actually represent lot/contract size in coins
+  const candidates = [
+    meta?.lot_size,
+    meta?.contract_size,
+    meta?.contract_value,
+    meta?.contract_unit,
+  ];
+
+  for (const v of candidates) {
+    const n = Number(v);
+    if (Number.isFinite(n) && n > 0) return n;
+  }
+
+  // last resort (often NOT coins-per-lot, but better than nothing)
+  const step = Number(meta?.qty_step);
+  if (Number.isFinite(step) && step > 0 && step >= 1) return step;
+
+  return 1;
 }
+
 function getCachedLotMult(psym){ return LOT_MULT_CACHE.get(psym)?.m || null; }
-function setCachedLotMult(psym, m){ if (m && m >= 1 && m <= 1e9) LOT_MULT_CACHE.set(psym,{m: Math.round(m), ts: Date.now()}); }
+function setCachedLotMult(psym, m){
+  const n = Number(m);
+  if (Number.isFinite(n) && n > 0 && n <= 1e9) LOT_MULT_CACHE.set(psym,{m: n, ts: Date.now()});
+}
+
+// ✅ NEW: dynamic lot mult getter for ANY symbol
+async function getLotMult(psym){
+  psym = String(psym||'').toUpperCase();
+
+  const cached = getCachedLotMult(psym);
+  if (cached) return cached;
+
+  const meta = await getProductMeta(psym);
+  const m = lotMultiplierFromMeta(meta);
+
+  setCachedLotMult(psym, m);
+
+  console.log('lotMult resolved', {
+    psym,
+    lotMult: m,
+    lot_size: meta?.lot_size,
+    contract_size: meta?.contract_size,
+    contract_value: meta?.contract_value,
+    contract_unit: meta?.contract_unit,
+    qty_step: meta?.qty_step
+  });
+
+  return m;
+}
 
 async function getTickerPriceUSD(psym){
   try {
@@ -306,7 +343,10 @@ async function getTickerPriceUSD(psym){
 // ---------- sizing ----------
 function lotsFromAmount({ amount, ccy='INR', leverage=DEFAULT_LEVERAGE, entryPxUSD, lotMult=1, fxInrPerUsd=FX_INR_FALLBACK }){
   leverage = Math.max(1, Math.floor(nnum(leverage, DEFAULT_LEVERAGE)));
-  lotMult  = Math.max(1, Math.floor(nnum(lotMult, 1)));
+
+  // lotMult = coins per 1 lot
+  lotMult  = Math.max(1e-12, nnum(lotMult, 1));
+
   const fx  = nnum(fxInrPerUsd, FX_INR_FALLBACK);
   const px  = nnum(entryPxUSD, 0);
   const amt = nnum(amount, 0);
@@ -314,8 +354,10 @@ function lotsFromAmount({ amount, ccy='INR', leverage=DEFAULT_LEVERAGE, entryPxU
 
   const marginUSD   = (ccy.toUpperCase()==='USD') ? amt : (amt / fx);
   const notionalUSD = marginUSD * leverage * (1 - MARGIN_BUFFER_PCT);
-  const coins       = notionalUSD / px;
-  const lots        = Math.floor(coins / lotMult);
+  const coinsWanted = notionalUSD / px;
+
+  // convert coins -> lots
+  const lots = Math.floor(coinsWanted / lotMult);
   return Math.max(1, lots);
 }
 
@@ -344,10 +386,16 @@ async function learnLotMultFromPositions(psym){
     if (!coinsAbs || !lotsSent) return;
 
     const m = coinsAbs / lotsSent;
-    if (Math.abs(m - Math.round(m)) < 1e-4 && Math.round(m) >= 1) {
-      setCachedLotMult(psym, Math.round(m));
+
+    // ✅ improved accept rules:
+    const nearInt = Math.abs(m - Math.round(m)) < 1e-6;
+
+    // accept if integer >= 1 OR fractional contract sizes (rare but possible)
+    if ((nearInt && Math.round(m) >= 1) || (m > 0 && m < 1)) {
+      const learned = nearInt ? Math.round(m) : m;
+      setCachedLotMult(psym, learned);
       LAST_ENTRY_SENT.delete(psym);
-      console.log('learned lot multiplier', { product_symbol: psym, m: Math.round(m) });
+      console.log('learned lot multiplier', { product_symbol: psym, learned, coinsAbs, lotsSent });
     }
   } catch {}
 }
@@ -357,12 +405,8 @@ async function placeEntry(m){
   const side = (m.side||'').toLowerCase()==='buy' ? 'buy' : 'sell';
   const product_symbol = toProductSymbol(m.symbol || m.product_symbol);
 
-  let lotMult = getCachedLotMult(product_symbol);
-  if (!lotMult) {
-    const meta = await getProductMeta(product_symbol);
-    lotMult = lotMultiplierFromMeta(meta);
-    setCachedLotMult(product_symbol, lotMult);
-  }
+  // ✅ dynamic lot mult for ANY symbol
+  const lotMult = await getLotMult(product_symbol);
 
   let sizeLots = parseInt(m.qty,10);
   let usedMode = 'qty';
@@ -385,9 +429,20 @@ async function placeEntry(m){
 
     sizeLots = lotsFromAmount({ amount, ccy, leverage, entryPxUSD, lotMult, fxInrPerUsd: fxHint });
     usedMode = `${ccy==='USD'?'amount_usd':'amount_inr'}`;
+
+    console.log('amount sizing debug', {
+      product_symbol,
+      amount,
+      ccy,
+      leverage,
+      entryPxUSD,
+      lotMult,
+      sizeLots
+    });
   }
 
   sizeLots = clamp(sizeLots, 1, MAX_LOTS_PER_ORDER);
+
   console.log('entry size normalization', { product_symbol, side, lotMult, usedMode, sizeLots });
 
   const out = await dcall('POST','/v2/orders',{
@@ -420,13 +475,8 @@ async function placeBatch(m){
     throw new Error('placeBatch: missing orders[]');
   }
 
-  let lotMult = getCachedLotMult(psym);
-  if (!lotMult) {
-    const meta  = await getProductMeta(psym);
-    lotMult = lotMultiplierFromMeta(meta);
-    setCachedLotMult(psym, lotMult);
-  }
-  lotMult = lotMult || 1;
+  // ✅ dynamic lot mult for ANY symbol
+  const lotMult = await getLotMult(psym);
 
   const last = LAST_SIDE.get(psym) || null;
 
@@ -436,14 +486,19 @@ async function placeBatch(m){
     orders: m.orders.slice(0, 50).map((o, idx) => {
       const oo = { ...o };
 
+      // If pine sends coins explicitly, convert coins -> lots
       const coins = nnum(oo.size_coins ?? oo.coins, 0);
-      if (coins > 0) oo.size = Math.max(1, Math.floor(coins / lotMult));
+      if (coins > 0) {
+        oo.size = Math.max(1, Math.floor(coins / lotMult));
+      }
 
+      // If pine mistakenly sent "size" as coins, convert if divisible
       if (!coins && nnum(oo.size,0) > lotMult &&
           Math.abs(nnum(oo.size,0) / lotMult - Math.round(nnum(oo.size,0) / lotMult)) < 1e-6) {
         oo.size = Math.max(1, Math.floor(nnum(oo.size,0) / lotMult));
       }
 
+      // ensure TP side is opposite of entry (reduce-only)
       if (last && (!oo.side || String(oo.side).toLowerCase() === last)) {
         oo.side = oppositeSide(last);
       }
@@ -472,6 +527,12 @@ async function placeBatch(m){
       return cleaned;
     })
   };
+
+  console.log('batch sizing debug', {
+    product_symbol: psym,
+    lotMult,
+    orders_preview: body.orders.slice(0, 3)
+  });
 
   return dcall('POST','/v2/orders/batch', body);
 }
@@ -596,12 +657,7 @@ async function closePositionBySymbol(symbolOrProductSymbol){
   if (looksLikeLots) {
     lots = Math.max(1, Math.abs(Math.round(rawSize)));
   } else {
-    let lotMult = getCachedLotMult(psym);
-    if (!lotMult) {
-      const meta = await getProductMeta(psym);
-      lotMult = lotMultiplierFromMeta(meta);
-      setCachedLotMult(psym, lotMult);
-    }
+    const lotMult = await getLotMult(psym);
     const absCoins = Math.abs(rawSize);
     lots = Math.max(1, Math.ceil((absCoins / lotMult) - 1e-12));
   }
@@ -914,8 +970,7 @@ app.post('/tv', async (req, res) => {
             if (STRICT_SEQUENCE) setSigState(sigId, psym, { lastSeq: 0 });
             progressed.push({ ok:true, did:'CANCAL', synthetic:true, steps, flat, symbol: psym });
           } else {
-            // ✅ To avoid stalling when Pine disables CANCAL, allow progression if ENTER exists.
-            // ENTER step will do the cancel/close per Pine flags anyway.
+            // To avoid stalling when Pine disables CANCAL, allow progression if ENTER exists.
             if (chain.enterMsg) {
               chain.didCancel = true;
               if (STRICT_SEQUENCE) setSigState(sigId, psym, { lastSeq: 0 });
@@ -949,7 +1004,7 @@ app.post('/tv', async (req, res) => {
 
         const enterMsg = chain.enterMsg;
 
-        // ✅ MATCH PINE: ENTER can cancel_orders & close_position BEFORE entry.
+        // MATCH PINE: ENTER can cancel_orders & close_position BEFORE entry.
         if (!chain.didEnterPrep) {
           const pre = await preflightFromEnterMsg(enterMsg, psym);
           chain.didEnterPrep = true;
@@ -959,7 +1014,6 @@ app.post('/tv', async (req, res) => {
         const requireFlat = (typeof enterMsg.require_flat === 'undefined') ? true : !!enterMsg.require_flat;
 
         if (requireFlat) {
-          // quick check
           const flatNow = isScopeAll(enterMsg) ? await isFlatNowGlobal() : await isFlatNowSymbol(psym);
 
           if (!flatNow) {
@@ -1038,4 +1092,3 @@ app.post('/tv', async (req, res) => {
 app.listen(PORT, ()=>console.log(
   `Relay listening http://localhost:${PORT} (BASE=${BASE_URL}, AUTH=${AUTH_MODE}, STRICT_SEQUENCE=${STRICT_SEQUENCE}, FAST_ENTER=${FAST_ENTER}, SIGNAL_CHAIN_WINDOW_MS=${SIGNAL_CHAIN_WINDOW_MS}, AUTO_CANCEL_ON_ENTER=${AUTO_CANCEL_ON_ENTER}, FORCE_CLOSE_ON_CANCEL=${FORCE_CLOSE_ON_CANCEL})`
 ));
-

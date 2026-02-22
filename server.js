@@ -6,10 +6,9 @@
 // - ENTER(seq1): cancel_orders=true, close_position=true, require_flat=true
 // - BATCH_TPS(seq2): places TP batch
 //
-// ✅ FIXES INCLUDED (DYNAMIC LOT MULT ACROSS ALL COINS):
-// 1) Dynamic coins-per-lot (lotMult) for ANY symbol:
-//    - cache -> /v2/products meta -> fallback 1
-// 2) Safer lotMult meta picking (prioritizes lot_size/contract_size)
+// ✅ FIXES INCLUDED (DYNAMIC LOT MULT ACROSS ALL COINS, INCLUDING "10 ARC"):
+// 1) Robust lotMult parsing: handles numeric fields AND strings like "10 ARC", "0.1 LINK"
+// 2) Safer lotMult meta picking (prioritizes lot_size/contract_size/contract_value/contract_unit)
 // 3) Learning fallback improved (learn coinsPerLot from positions)
 //
 // ⚠️ Cloud Run: Use Max instances = 1 (and ideally concurrency = 1) OR store state in Redis/Firestore.
@@ -24,6 +23,17 @@ function nowTsSec(){ return Math.floor(Date.now()/1000).toString(); }
 function sleep(ms){ return new Promise(r=>setTimeout(r,ms)); }
 function clamp(n,min,max){ return Math.min(Math.max(n,min),max); }
 function nnum(x, d=0){ const n = Number(x); return Number.isFinite(n) ? n : d; }
+
+// ✅ NEW: robust numeric parser (supports "10 ARC", "0.1 LINK", "100 H", etc.)
+function parseNum(v){
+  if (v === null || typeof v === 'undefined') return null;
+  if (typeof v === 'number' && Number.isFinite(v)) return v;
+  const s = String(v).trim();
+  const m = s.match(/-?\d+(\.\d+)?/); // extract first number
+  if (!m) return null;
+  const n = Number(m[0]);
+  return Number.isFinite(n) ? n : null;
+}
 
 function toProductSymbol(sym){
   if(!sym) return sym;
@@ -276,9 +286,10 @@ async function getProductIdBySymbol(psym){
 
 const LOT_MULT_CACHE = new Map(); // product_symbol -> { m, ts }
 
-// ✅ UPDATED: safer meta selection for "coins per 1 lot"
+// ✅ UPDATED: safer meta selection for "coins per 1 lot" + robust parsing of string values
 function lotMultiplierFromMeta(meta){
-  // Prefer fields that actually represent lot/contract size in coins
+  // Prefer fields that actually represent lot/contract size in coins.
+  // Any of these might be numbers OR strings like "10 ARC".
   const candidates = [
     meta?.lot_size,
     meta?.contract_size,
@@ -287,13 +298,13 @@ function lotMultiplierFromMeta(meta){
   ];
 
   for (const v of candidates) {
-    const n = Number(v);
-    if (Number.isFinite(n) && n > 0) return n;
+    const n = parseNum(v);
+    if (n && n > 0) return n;
   }
 
   // last resort (often NOT coins-per-lot, but better than nothing)
-  const step = Number(meta?.qty_step);
-  if (Number.isFinite(step) && step > 0 && step >= 1) return step;
+  const step = parseNum(meta?.qty_step);
+  if (step && step > 0 && step >= 1) return step;
 
   return 1;
 }
@@ -387,10 +398,8 @@ async function learnLotMultFromPositions(psym){
 
     const m = coinsAbs / lotsSent;
 
-    // ✅ improved accept rules:
-    const nearInt = Math.abs(m - Math.round(m)) < 1e-6;
-
     // accept if integer >= 1 OR fractional contract sizes (rare but possible)
+    const nearInt = Math.abs(m - Math.round(m)) < 1e-6;
     if ((nearInt && Math.round(m) >= 1) || (m > 0 && m < 1)) {
       const learned = nearInt ? Math.round(m) : m;
       setCachedLotMult(psym, learned);

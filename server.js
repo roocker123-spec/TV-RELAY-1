@@ -1,4 +1,3 @@
-```js
 // server.js (FULL) — LOTS sizing from your “lot logic” script + TP booking logic adopted/fixed
 // PER-SYMBOL queue/lock, sig_id+seq idempotency,
 // STRICT sequencing: expects CANCAL(seq0) -> ENTER(seq1) -> BATCH_TPS(seq2)
@@ -1190,13 +1189,5 @@ app.post('/tv', async (req, res) => {
 app.listen(PORT, ()=>console.log(
   `Relay listening http://localhost:${PORT} (BASE=${BASE_URL}, AUTH=${AUTH_MODE}, STRICT_SEQUENCE=${STRICT_SEQUENCE}, FAST_ENTER=${FAST_ENTER}, SIGNAL_CHAIN_WINDOW_MS=${SIGNAL_CHAIN_WINDOW_MS}, AUTO_CANCEL_ON_ENTER=${AUTO_CANCEL_ON_ENTER}, FORCE_CLOSE_ON_CANCEL=${FORCE_CLOSE_ON_CANCEL})`
 ));
-```
 
-If you deploy this and you **still** don’t see TPs on Delta, the fastest way to pinpoint is:
 
-* In Cloud Run logs, search for **`BATCH_TPS placing`** and **`BATCH_TPS result`**.
-
-  * If you don’t see `BATCH_TPS placing` → Pine isn’t sending seq=2 (or it’s being deduped).
-  * If you see it, but no orders appear → the response JSON in `BATCH_TPS result` will show whether Delta rejected specific orders (price/side/size).
-
-Share one `BATCH_TPS result` log chunk (the JSON error part) and I’ll adjust the payload to exactly what Delta is rejecting.

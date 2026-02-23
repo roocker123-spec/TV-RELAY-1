@@ -1,14 +1,11 @@
-// server.js (FULL) — LOTS sizing from your “lot logic” script + TP booking logic adopted/fixed
+// server.js (FULL) — LOTS sizing + STRICT chain + TP batch booking (FIXED)
+// ✅ Fixes added:
+//  A) client_order_id <= 32 chars (Delta validation) via hash-based short ID
+//  B) FIX orders pagination: Delta uses cursor pagination (after/page_size), not page/per_page
+//  C) default SIGNAL_CHAIN_WINDOW_MS raised to 120s (still env-overridable)
+//
 // PER-SYMBOL queue/lock, sig_id+seq idempotency,
 // STRICT sequencing: expects CANCAL(seq0) -> ENTER(seq1) -> BATCH_TPS(seq2)
-//
-// ✅ THIS COMBINATION INCLUDES:
-// 1) Robust lotMult parsing for "10 ARC", "0.1 LINK", "1000 PEPE" etc.
-// 2) inferPositionUnits(): detects if positions API size is LOTS or COINS (fixes ARC/other weirdness)
-// 3) closePositionBySymbol(): always closes correct lots
-// 4) ✅ TP booking fixed: batch payload + stronger TP size normalization (prevents double-dividing)
-// 5) batch uses product_id + product_symbol + cleaned orders + unique client_order_id
-// 6) side auto-correct to opposite of last entry (reduce-only)
 //
 // ⚠️ Cloud Run: Best is max instances=1 (and ideally concurrency=1) unless you persist CHAIN/SEEN in Redis/DB.
 
@@ -111,7 +108,10 @@ const FAST_ENTER_RETRY_MS = nnum(process.env.FAST_ENTER_RETRY_MS, 8000);
 
 // ---------- STRICT sequence (default ON) ----------
 const STRICT_SEQUENCE = String(process.env.STRICT_SEQUENCE || 'true').toLowerCase() !== 'false';
-const SIGNAL_CHAIN_WINDOW_MS = nnum(process.env.SIGNAL_CHAIN_WINDOW_MS, 15_000);
+
+// ✅ raise default to 120s; still override via env
+const SIGNAL_CHAIN_WINDOW_MS = nnum(process.env.SIGNAL_CHAIN_WINDOW_MS, 120_000);
+
 const AUTO_CANCEL_ON_ENTER = String(process.env.AUTO_CANCEL_ON_ENTER || 'false').toLowerCase() === 'true';
 
 // Defaults for cancel step ONLY
@@ -524,11 +524,6 @@ async function placeEntry(m){
 }
 
 // -------------------- TP SIZE NORMALIZATION (FIX) --------------------
-// Pine can send TP size as either COINS or LOTS (depends on your Pine).
-// This function decides correctly using:
-// - explicit size_coins/coins -> coins
-// - compare against last entry lots and last entry coins (lots * lotMult)
-// - divisibility heuristics as fallback
 function normalizeTpSizeLots({ psym, lotMult, order, lastEntry }) {
   const coins = nnum(order?.size_coins ?? order?.coins, 0);
   if (coins > 0) {
@@ -542,35 +537,37 @@ function normalizeTpSizeLots({ psym, lotMult, order, lastEntry }) {
   const lastLots = lastEntry?.lots ? nnum(lastEntry.lots, 0) : 0;
   const lastCoins = (lastLots > 0) ? (lastLots * lotMult) : 0;
 
-  // ✅ Strong guess: if it looks like a lot-count around your position lots => treat as lots
   if (sInt && lastLots > 0 && s <= Math.max(lastLots, 1) * 2) {
     return Math.max(1, Math.round(s));
   }
 
-  // ✅ Strong guess: if it matches coins scale => treat as coins
   if (lastCoins > 0 && s >= Math.max(lastCoins * 0.5, lotMult * 2)) {
     return Math.max(1, Math.floor(s / lotMult));
   }
 
-  // Heuristic: if not divisible by lotMult and integer -> likely lots (ARC case 58 vs lotMult 10)
   if (lotMult > 1 && sInt && (s % lotMult) !== 0) {
     return Math.max(1, Math.round(s));
   }
 
-  // If huge, treat as coins
   if (lotMult > 1 && s > MAX_LOTS_PER_ORDER) {
     return Math.max(1, Math.floor(s / lotMult));
   }
 
-  // Default:
-  // If lotMult>1 and size is relatively big => likely coins, else lots.
   if (lotMult > 1) {
-    // if size is small-ish, keep as lots (prevents “double-divide”)
     if (sInt && s <= 5000) return Math.max(1, Math.round(s));
     return Math.max(1, Math.floor(s / lotMult));
   }
 
   return Math.max(1, Math.round(s));
+}
+
+// ✅ Delta client_order_id max len = 32 => generate short deterministic-ish ID
+function shortClientOrderId(sigId, psym, idx){
+  const base = `${String(sigId||'')}|${String(psym||'')}|TP|${idx}|${Date.now()}`;
+  const h = crypto.createHash('sha1').update(base).digest('hex'); // 40 chars
+  const p = String(psym || '').toUpperCase().replace(/[^A-Z0-9]/g,'').slice(0,6);
+  // Format: "T" + idx(1-2 chars) + p(<=6) + "_" + 22 hex = <= 32
+  return `T${idx}${p}_${h.slice(0,22)}`.slice(0,32);
 }
 
 async function placeBatch(m){
@@ -599,11 +596,9 @@ async function placeBatch(m){
   const orders = m.orders.slice(0, 50).map((o, idx) => {
     const oo = { ...o };
 
-    // ✅ Normalize TP size (prevents “no TP” when size becomes 0 or too small)
     const sizeLots = normalizeTpSizeLots({ psym, lotMult, order: oo, lastEntry });
     if (!sizeLots) throw new Error(`placeBatch: bad size on order #${idx}`);
 
-    // ✅ ensure TP side opposite of entry
     if (lastSide) {
       if (!oo.side) oo.side = oppositeSide(lastSide);
       else {
@@ -612,35 +607,30 @@ async function placeBatch(m){
       }
     }
 
-    // Required fields
     if (!oo.order_type) oo.order_type = 'limit_order';
     if (typeof oo.reduce_only === 'undefined') oo.reduce_only = true;
 
-    // Normalize limit_price
     if (!oo.limit_price && (oo.price || oo.lmt_price)) oo.limit_price = oo.price || oo.lmt_price;
     if (typeof oo.limit_price !== 'undefined') oo.limit_price = String(oo.limit_price);
 
-    // Unique client_order_id (helps Delta avoid rejecting duplicates)
-    if (!oo.client_order_id) {
-      oo.client_order_id = `${sigId}:${psym}:TP:${idx}:${Date.now()}`;
-    }
+    // ✅ FIX: client_order_id <= 32
+    if (!oo.client_order_id) oo.client_order_id = shortClientOrderId(sigId, psym, idx);
+    oo.client_order_id = String(oo.client_order_id).slice(0, 32);
 
-    // Final cleaned payload (Delta batch is picky)
     const cleaned = {
       limit_price: oo.limit_price,
       size: Math.max(1, parseInt(sizeLots, 10)),
       side: String(oo.side || '').toLowerCase(),
       order_type: oo.order_type || 'limit_order',
-      reduce_only: !!oo.reduce_only
+      reduce_only: !!oo.reduce_only,
+      client_order_id: oo.client_order_id
     };
 
     if (!cleaned.limit_price) throw new Error(`placeBatch: missing limit_price on order #${idx}`);
     if (!cleaned.side || !['buy','sell'].includes(cleaned.side)) throw new Error(`placeBatch: missing/invalid side on order #${idx}`);
 
-    // Optional flags
     if (typeof oo.post_only !== 'undefined') cleaned.post_only = !!oo.post_only;
     if (typeof oo.mmp !== 'undefined') cleaned.mmp = !!oo.mmp;
-    if (oo.client_order_id) cleaned.client_order_id = String(oo.client_order_id);
 
     return cleaned;
   });
@@ -654,8 +644,6 @@ async function placeBatch(m){
     first3: orders.slice(0,3)
   });
 
-  // ✅ Adopted from your “TP working script”: include product_id + product_symbol + orders
-  // (Some Delta environments are stricter; this avoids silent “accepted but no orders” cases)
   const body = {
     product_id: pid,
     product_symbol: psym,
@@ -696,19 +684,29 @@ async function cancelOrder({ id, client_order_id, product_id, product_symbol }){
   return dcall('DELETE', '/v2/orders', payload);
 }
 
+// ✅ FIXED pagination (cursor-based): after + page_size
 async function listOpenOrdersAllPages(){
   let all = [];
-  let page = 1;
-  while (true){
-    const q = `?states=open,pending&page=${page}&per_page=200`;
+  let after = null;
+
+  while (true) {
+    const q =
+      `?states=open,pending&page_size=200` +
+      (after ? `&after=${encodeURIComponent(after)}` : '');
+
     const oo = await dcall('GET','/v2/orders', null, q);
+
     const arr = Array.isArray(oo?.result) ? oo.result
               : Array.isArray(oo?.orders) ? oo.orders
               : Array.isArray(oo) ? oo : [];
+
     all = all.concat(arr);
-    if (arr.length < 200) break;
-    page++;
+
+    const nextAfter = oo?.meta?.after || null;
+    if (!nextAfter || arr.length === 0) break;
+    after = nextAfter;
   }
+
   return all;
 }
 

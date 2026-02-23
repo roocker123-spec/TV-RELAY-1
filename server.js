@@ -1,12 +1,17 @@
-// server.js (FULL) — PER-SYMBOL queue/lock, sig_id+seq idempotency,
+```js
+// server.js (FULL) — LOTS sizing from your “lot logic” script + TP booking logic adopted/fixed
+// PER-SYMBOL queue/lock, sig_id+seq idempotency,
 // STRICT sequencing: expects CANCAL(seq0) -> ENTER(seq1) -> BATCH_TPS(seq2)
 //
-// ✅ FIXES (LOTS vs COINS + TP batch):
+// ✅ THIS COMBINATION INCLUDES:
 // 1) Robust lotMult parsing for "10 ARC", "0.1 LINK", "1000 PEPE" etc.
-// 2) ✅ NEW: inferPositionUnits() to detect if positions API size is LOTS or COINS (fixes ARC case)
-// 3) ✅ closePositionBySymbol() now closes correct quantity always
-// 4) ✅ placeBatch() now normalizes TP size correctly (no double-division), adds client_order_id
-// 5) ✅ learning lotMult no longer corrupts cache when positions API reports LOTS
+// 2) inferPositionUnits(): detects if positions API size is LOTS or COINS (fixes ARC/other weirdness)
+// 3) closePositionBySymbol(): always closes correct lots
+// 4) ✅ TP booking fixed: batch payload + stronger TP size normalization (prevents double-dividing)
+// 5) batch uses product_id + product_symbol + cleaned orders + unique client_order_id
+// 6) side auto-correct to opposite of last entry (reduce-only)
+//
+// ⚠️ Cloud Run: Best is max instances=1 (and ideally concurrency=1) unless you persist CHAIN/SEEN in Redis/DB.
 
 require('dotenv').config();
 const express = require('express');
@@ -41,13 +46,14 @@ function isScopeAll(msg){
 }
 function safeUpper(x){ return String(x||'').toUpperCase(); }
 function sigKey(sigId, psym){ return `${String(sigId||'')}|${safeUpper(psym||'')}`; }
+function oppositeSide(side){ return (String(side||'').toLowerCase()==='buy') ? 'sell' : 'buy'; }
 
 // ---------- queue (serializes webhook execution) ----------
 const QUEUE = new Map(); // key -> Promise chain
 function enqueue(key, fn) {
   const prev = QUEUE.get(key) || Promise.resolve();
   const next = prev
-    .catch(() => {})
+    .catch(() => {})          // keep chain alive even if prev errored
     .then(fn)
     .finally(() => {
       if (QUEUE.get(key) === next) QUEUE.delete(key);
@@ -82,7 +88,7 @@ app.use((req, _res, next) => {
 const API_KEY       = process.env.DELTA_API_KEY || '';
 const API_SECRET    = process.env.DELTA_API_SECRET || '';
 const BASE_URL      = (process.env.DELTA_BASE || process.env.DELTA_BASE_URL || 'https://api.india.delta.exchange').replace(/\/+$/,'');
-const WEBHOOK_TOKEN = process.env.WEBHOOK_TOKEN || '';
+const WEBHOOK_TOKEN = process.env.WEBHOOK_TOKEN || ''; // optional header check
 const PORT          = process.env.PORT || 3000;
 
 const AUTH_MODE     = (process.env.DELTA_AUTH || 'hmac').toLowerCase(); // 'hmac' | 'keyonly'
@@ -356,7 +362,6 @@ function rememberSide(productSymbol, side){
   const s = String(side||'').toLowerCase()==='buy' ? 'buy' : 'sell';
   LAST_SIDE.set(productSymbol, s);
 }
-function oppositeSide(side){ return (String(side||'').toLowerCase()==='buy') ? 'sell' : 'buy'; }
 
 // ---------- positions ----------
 async function listPositionsArray(){
@@ -379,7 +384,7 @@ async function listPositionsArray(){
   return [];
 }
 
-// ✅ NEW: infer whether position.size is LOTS or COINS
+// ✅ infer whether position.size is LOTS or COINS
 async function inferPositionUnits({ psym, rawSize, lotMult, posRow }){
   const abs = Math.abs(Number(rawSize || 0));
   if (!(abs > 0)) return { units: 'unknown', lots: 0 };
@@ -394,30 +399,23 @@ async function inferPositionUnits({ psym, rawSize, lotMult, posRow }){
 
     const rel = (a,b)=> Math.abs(a-b) / Math.max(1e-9, Math.abs(b));
 
-    // If abs matches lotsEst closely => abs is lots
     if (rel(abs, lotsEst) < 0.25) {
       return { units:'lots', lots: Math.max(1, Math.round(abs)) };
     }
-    // If abs matches coinsEst closely => abs is coins
     if (rel(abs, coinsEst) < 0.25) {
       return { units:'coins', lots: Math.max(1, Math.floor(coinsEst / lotMult)) };
     }
   }
 
   // Heuristic fallback:
-  // If abs % lotMult != 0, it's very likely LOTS (your ARC case: 58 lots, lotMult=10)
   if (lotMult > 1 && Number.isInteger(abs) && (abs % lotMult) !== 0) {
     return { units:'lots', lots: Math.max(1, Math.round(abs)) };
   }
 
-  // If abs is huge, treat as coins
   if (lotMult > 1 && abs > MAX_LOTS_PER_ORDER) {
     return { units:'coins', lots: Math.max(1, Math.floor(abs / lotMult)) };
   }
 
-  // Default:
-  // - for lotMult>1 assume coins
-  // - else assume lots
   if (lotMult > 1) {
     return { units:'coins', lots: Math.max(1, Math.floor(abs / lotMult)) };
   }
@@ -425,9 +423,9 @@ async function inferPositionUnits({ psym, rawSize, lotMult, posRow }){
 }
 
 // ---------- order helpers ----------
-const LAST_ENTRY_SENT = new Map(); // psym -> { lots, ts, side }
+const LAST_ENTRY_SENT = new Map(); // psym -> { lots, ts, side, lotMult }
 
-// ✅ UPDATED learning: uses inferred position units so it doesn't learn wrong "1" for ARC
+// ✅ learning: uses inferred position units so it doesn't learn wrong cache
 async function learnLotMultFromPositions(psym){
   const last = LAST_ENTRY_SENT.get(psym);
   if (!last || (Date.now()-last.ts) > 15_000) return;
@@ -442,7 +440,6 @@ async function learnLotMultFromPositions(psym){
     const rawSize = Number(row.size||row.position_size||0);
     const inferred = await inferPositionUnits({ psym, rawSize, lotMult: lotMultMeta, posRow: row });
 
-    // If API gives LOTS, derive coins = lots * lotMult
     const coinsAbs = inferred.units === 'lots'
       ? Math.abs(rawSize) * lotMultMeta
       : Math.abs(rawSize);
@@ -451,17 +448,27 @@ async function learnLotMultFromPositions(psym){
     if (!coinsAbs || !lotsSent) return;
 
     const m = coinsAbs / lotsSent;
-
     const nearInt = Math.abs(m - Math.round(m)) < 1e-6;
+
     if ((nearInt && Math.round(m) >= 1) || (m > 0 && m < 1)) {
       const learned = nearInt ? Math.round(m) : m;
 
-      // Only accept learning if it doesn't conflict strongly with meta
       if (Math.abs(learned - lotMultMeta) / Math.max(1, lotMultMeta) < 0.5) {
         setCachedLotMult(psym, learned);
-        console.log('learned lot multiplier', { product_symbol: psym, learned, coinsAbs, lotsSent, inferred_units: inferred.units });
+        console.log('learned lot multiplier', {
+          product_symbol: psym,
+          learned,
+          coinsAbs,
+          lotsSent,
+          inferred_units: inferred.units
+        });
       } else {
-        console.log('learn rejected (conflicts with meta)', { psym, learned, lotMultMeta, inferred_units: inferred.units });
+        console.log('learn rejected (conflicts with meta)', {
+          psym,
+          learned,
+          lotMultMeta,
+          inferred_units: inferred.units
+        });
       }
 
       LAST_ENTRY_SENT.delete(psym);
@@ -512,27 +519,57 @@ async function placeEntry(m){
   });
 
   rememberSide(product_symbol, side);
-  LAST_ENTRY_SENT.set(product_symbol, { lots: sizeLots, ts: Date.now(), side });
+  LAST_ENTRY_SENT.set(product_symbol, { lots: sizeLots, ts: Date.now(), side, lotMult });
   learnLotMultFromPositions(product_symbol).catch(()=>{});
   return out;
 }
 
-// ✅ helper: normalize TP order size from Pine (coins vs lots)
-function normalizeTpSize({ psym, lotMult, oSize, oCoins }){
-  const coins = nnum(oCoins, 0);
-  if (coins > 0) return Math.max(1, Math.floor(coins / lotMult));
+// -------------------- TP SIZE NORMALIZATION (FIX) --------------------
+// Pine can send TP size as either COINS or LOTS (depends on your Pine).
+// This function decides correctly using:
+// - explicit size_coins/coins -> coins
+// - compare against last entry lots and last entry coins (lots * lotMult)
+// - divisibility heuristics as fallback
+function normalizeTpSizeLots({ psym, lotMult, order, lastEntry }) {
+  const coins = nnum(order?.size_coins ?? order?.coins, 0);
+  if (coins > 0) {
+    return Math.max(1, Math.floor(coins / lotMult));
+  }
 
-  const s = nnum(oSize, 0);
+  const s = nnum(order?.size, 0);
   if (!(s > 0)) return 0;
 
-  // If size not divisible by lotMult => likely already LOTS (ARC example: 58 not divisible by 10)
-  if (lotMult > 1 && Number.isInteger(s) && (s % lotMult) !== 0) return Math.max(1, Math.round(s));
+  const sInt = Number.isInteger(s);
+  const lastLots = lastEntry?.lots ? nnum(lastEntry.lots, 0) : 0;
+  const lastCoins = (lastLots > 0) ? (lastLots * lotMult) : 0;
 
-  // If size is huge => treat as coins
-  if (lotMult > 1 && s > MAX_LOTS_PER_ORDER) return Math.max(1, Math.floor(s / lotMult));
+  // ✅ Strong guess: if it looks like a lot-count around your position lots => treat as lots
+  if (sInt && lastLots > 0 && s <= Math.max(lastLots, 1) * 2) {
+    return Math.max(1, Math.round(s));
+  }
 
-  // Default: if lotMult>1 assume Pine sent coins
-  if (lotMult > 1) return Math.max(1, Math.floor(s / lotMult));
+  // ✅ Strong guess: if it matches coins scale => treat as coins
+  if (lastCoins > 0 && s >= Math.max(lastCoins * 0.5, lotMult * 2)) {
+    return Math.max(1, Math.floor(s / lotMult));
+  }
+
+  // Heuristic: if not divisible by lotMult and integer -> likely lots (ARC case 58 vs lotMult 10)
+  if (lotMult > 1 && sInt && (s % lotMult) !== 0) {
+    return Math.max(1, Math.round(s));
+  }
+
+  // If huge, treat as coins
+  if (lotMult > 1 && s > MAX_LOTS_PER_ORDER) {
+    return Math.max(1, Math.floor(s / lotMult));
+  }
+
+  // Default:
+  // If lotMult>1 and size is relatively big => likely coins, else lots.
+  if (lotMult > 1) {
+    // if size is small-ish, keep as lots (prevents “double-divide”)
+    if (sInt && s <= 5000) return Math.max(1, Math.round(s));
+    return Math.max(1, Math.floor(s / lotMult));
+  }
 
   return Math.max(1, Math.round(s));
 }
@@ -555,60 +592,87 @@ async function placeBatch(m){
   }
 
   const lotMult = await getLotMult(psym);
-  const last = LAST_SIDE.get(psym) || null;
+  const lastSide = LAST_SIDE.get(psym) || null;
   const sigId = String(m.sig_id || m.signal_id || 'nosig');
+
+  const lastEntry = LAST_ENTRY_SENT.get(psym) || null;
 
   const orders = m.orders.slice(0, 50).map((o, idx) => {
     const oo = { ...o };
 
-    // ✅ Normalize size properly (coins vs lots)
-    const sizeLots = normalizeTpSize({
-      psym,
-      lotMult,
-      oSize: oo.size,
-      oCoins: (oo.size_coins ?? oo.coins)
-    });
+    // ✅ Normalize TP size (prevents “no TP” when size becomes 0 or too small)
+    const sizeLots = normalizeTpSizeLots({ psym, lotMult, order: oo, lastEntry });
     if (!sizeLots) throw new Error(`placeBatch: bad size on order #${idx}`);
-    oo.size = sizeLots;
 
-    // Ensure TP side opposite of entry (reduce-only)
-    if (last && (!oo.side || String(oo.side).toLowerCase() === last)) {
-      oo.side = oppositeSide(last);
+    // ✅ ensure TP side opposite of entry
+    if (lastSide) {
+      if (!oo.side) oo.side = oppositeSide(lastSide);
+      else {
+        const s = String(oo.side).toLowerCase();
+        if (s === lastSide) oo.side = oppositeSide(lastSide);
+      }
     }
 
-    if (typeof oo.reduce_only === 'undefined') oo.reduce_only = true;
+    // Required fields
     if (!oo.order_type) oo.order_type = 'limit_order';
-    if (!oo.limit_price && (oo.price || oo.lmt_price)) oo.limit_price = oo.price || oo.lmt_price;
+    if (typeof oo.reduce_only === 'undefined') oo.reduce_only = true;
 
+    // Normalize limit_price
+    if (!oo.limit_price && (oo.price || oo.lmt_price)) oo.limit_price = oo.price || oo.lmt_price;
     if (typeof oo.limit_price !== 'undefined') oo.limit_price = String(oo.limit_price);
 
-    // ✅ add unique client_order_id (Delta rejects duplicates sometimes)
+    // Unique client_order_id (helps Delta avoid rejecting duplicates)
     if (!oo.client_order_id) {
       oo.client_order_id = `${sigId}:${psym}:TP:${idx}:${Date.now()}`;
     }
 
-    // Clean payload
-    const allowed = [
-      'limit_price','size','side','order_type','reduce_only','post_only','mmp','client_order_id'
-    ];
-    const cleaned = {};
-    for (const k of allowed) if (typeof oo[k] !== 'undefined') cleaned[k] = oo[k];
+    // Final cleaned payload (Delta batch is picky)
+    const cleaned = {
+      limit_price: oo.limit_price,
+      size: Math.max(1, parseInt(sizeLots, 10)),
+      side: String(oo.side || '').toLowerCase(),
+      order_type: oo.order_type || 'limit_order',
+      reduce_only: !!oo.reduce_only
+    };
 
     if (!cleaned.limit_price) throw new Error(`placeBatch: missing limit_price on order #${idx}`);
-    if (!cleaned.side) throw new Error(`placeBatch: missing side on order #${idx}`);
-    if (!cleaned.order_type) cleaned.order_type = 'limit_order';
+    if (!cleaned.side || !['buy','sell'].includes(cleaned.side)) throw new Error(`placeBatch: missing/invalid side on order #${idx}`);
+
+    // Optional flags
+    if (typeof oo.post_only !== 'undefined') cleaned.post_only = !!oo.post_only;
+    if (typeof oo.mmp !== 'undefined') cleaned.mmp = !!oo.mmp;
+    if (oo.client_order_id) cleaned.client_order_id = String(oo.client_order_id);
 
     return cleaned;
   });
 
-  console.log('batch sizing debug', {
-    product_symbol: psym,
+  console.log('BATCH_TPS placing', {
+    psym,
+    pid,
     lotMult,
-    orders_preview: orders.slice(0, 3)
+    lastSide,
+    lastEntry: lastEntry ? { lots: lastEntry.lots, side: lastEntry.side, tsAgoMs: Date.now()-lastEntry.ts } : null,
+    first3: orders.slice(0,3)
   });
 
-  // ✅ safest payload: product_id + orders only
-  return dcall('POST','/v2/orders/batch', { product_id: pid, orders });
+  // ✅ Adopted from your “TP working script”: include product_id + product_symbol + orders
+  // (Some Delta environments are stricter; this avoids silent “accepted but no orders” cases)
+  const body = {
+    product_id: pid,
+    product_symbol: psym,
+    orders
+  };
+
+  const r = await dcall('POST','/v2/orders/batch', body);
+
+  console.log('BATCH_TPS result', {
+    psym,
+    success: r?.success,
+    keys: Object.keys(r || {}),
+    sample: (Array.isArray(r?.result) ? r.result.slice(0,2) : null)
+  });
+
+  return r;
 }
 
 // ---------- CANCEL/CLOSE ----------
@@ -686,7 +750,7 @@ async function cancelOrdersBySymbol(psym, { fallbackAll=false } = {}){
   return { ok:true, cancelled, failed, symbol: sym };
 }
 
-// ✅ FIXED closePositionBySymbol: uses inferPositionUnits()
+// ✅ closePositionBySymbol: uses inferPositionUnits()
 async function closePositionBySymbol(symbolOrProductSymbol){
   const psym = toProductSymbol(symbolOrProductSymbol);
   if (!psym) throw new Error('closePositionBySymbol: missing symbol/product_symbol');
@@ -717,6 +781,7 @@ async function closePositionBySymbol(symbolOrProductSymbol){
   });
 }
 
+// ---------- flat checks ----------
 async function waitUntilFlat(timeoutMs = FLAT_TIMEOUT_MS, pollMs = FLAT_POLL_MS) {
   const end = Date.now() + timeoutMs;
   while (Date.now() < end) {
@@ -1125,3 +1190,13 @@ app.post('/tv', async (req, res) => {
 app.listen(PORT, ()=>console.log(
   `Relay listening http://localhost:${PORT} (BASE=${BASE_URL}, AUTH=${AUTH_MODE}, STRICT_SEQUENCE=${STRICT_SEQUENCE}, FAST_ENTER=${FAST_ENTER}, SIGNAL_CHAIN_WINDOW_MS=${SIGNAL_CHAIN_WINDOW_MS}, AUTO_CANCEL_ON_ENTER=${AUTO_CANCEL_ON_ENTER}, FORCE_CLOSE_ON_CANCEL=${FORCE_CLOSE_ON_CANCEL})`
 ));
+```
+
+If you deploy this and you **still** don’t see TPs on Delta, the fastest way to pinpoint is:
+
+* In Cloud Run logs, search for **`BATCH_TPS placing`** and **`BATCH_TPS result`**.
+
+  * If you don’t see `BATCH_TPS placing` → Pine isn’t sending seq=2 (or it’s being deduped).
+  * If you see it, but no orders appear → the response JSON in `BATCH_TPS result` will show whether Delta rejected specific orders (price/side/size).
+
+Share one `BATCH_TPS result` log chunk (the JSON error part) and I’ll adjust the payload to exactly what Delta is rejecting.

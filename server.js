@@ -1,13 +1,18 @@
 // server.js (FULL) — LOTS sizing + STRICT chain + TP batch booking (FIXED)
-// ✅ Fixes added:
-//  A) client_order_id <= 32 chars (Delta validation) via hash-based short ID
-//  B) FIX orders pagination: Delta uses cursor pagination (after/page_size), not page/per_page
-//  C) default SIGNAL_CHAIN_WINDOW_MS raised to 120s (still env-overridable)
+// ✅ Fixes included:
+//  1) Robust lotMult parsing ("10 ARC", "0.1 LINK", "1000 PEPE"...)
+//  2) inferPositionUnits(): detects if positions API size is LOTS or COINS
+//  3) closePositionBySymbol(): always closes correct lots
+//  4) TP booking: correct batch payload + strong TP size normalization (prevents double-dividing)
+//  5) ✅ client_order_id <= 32 chars (Delta validation) via hash-based short ID
+//  6) ✅ FIX orders pagination: Delta uses cursor pagination (after/page_size), not page/per_page
+//  7) ✅ TP SIDE FIX: TP side forced from LIVE POSITION (short => buy, long => sell) (not LAST_SIDE / Pine)
+//  8) ✅ TP SIZE CLAMP: total TP lots clamped to current position lots
+//  9) ✅ ENTRY SAFETY: even if Pine sends qty, we clamp qty to what your (base amount * leverage) allows
 //
-// PER-SYMBOL queue/lock, sig_id+seq idempotency,
 // STRICT sequencing: expects CANCAL(seq0) -> ENTER(seq1) -> BATCH_TPS(seq2)
 //
-// ⚠️ Cloud Run: Best is max instances=1 (and ideally concurrency=1) unless you persist CHAIN/SEEN in Redis/DB.
+// ⚠️ Cloud Run: best max instances=1 and concurrency=1 unless you persist CHAIN/SEEN in Redis/DB.
 
 require('dotenv').config();
 const express = require('express');
@@ -388,37 +393,44 @@ async function inferPositionUnits({ psym, rawSize, lotMult, posRow }){
   const abs = Math.abs(Number(rawSize || 0));
   if (!(abs > 0)) return { units: 'unknown', lots: 0 };
 
-  // Best signal: compare to notional (if available)
   const notional = nnum(posRow?.notional || posRow?.position_notional || posRow?.value || 0, 0);
   const px = nnum(posRow?.mark_price || posRow?.entry_price || 0, 0) || nnum(await getTickerPriceUSD(psym), 0);
 
   if (notional > 0 && px > 0) {
-    const coinsEst = notional / px;            // estimated underlying coins
-    const lotsEst  = coinsEst / lotMult;       // estimated lots
+    const coinsEst = notional / px;
+    const lotsEst  = coinsEst / lotMult;
 
     const rel = (a,b)=> Math.abs(a-b) / Math.max(1e-9, Math.abs(b));
 
-    if (rel(abs, lotsEst) < 0.25) {
-      return { units:'lots', lots: Math.max(1, Math.round(abs)) };
-    }
-    if (rel(abs, coinsEst) < 0.25) {
-      return { units:'coins', lots: Math.max(1, Math.floor(coinsEst / lotMult)) };
-    }
+    if (rel(abs, lotsEst) < 0.25) return { units:'lots',  lots: Math.max(1, Math.round(abs)) };
+    if (rel(abs, coinsEst) < 0.25) return { units:'coins', lots: Math.max(1, Math.floor(coinsEst / lotMult)) };
   }
 
-  // Heuristic fallback:
-  if (lotMult > 1 && Number.isInteger(abs) && (abs % lotMult) !== 0) {
-    return { units:'lots', lots: Math.max(1, Math.round(abs)) };
-  }
+  if (lotMult > 1 && Number.isInteger(abs) && (abs % lotMult) !== 0) return { units:'lots', lots: Math.max(1, Math.round(abs)) };
 
-  if (lotMult > 1 && abs > MAX_LOTS_PER_ORDER) {
-    return { units:'coins', lots: Math.max(1, Math.floor(abs / lotMult)) };
-  }
+  if (lotMult > 1 && abs > MAX_LOTS_PER_ORDER) return { units:'coins', lots: Math.max(1, Math.floor(abs / lotMult)) };
 
-  if (lotMult > 1) {
-    return { units:'coins', lots: Math.max(1, Math.floor(abs / lotMult)) };
-  }
+  if (lotMult > 1) return { units:'coins', lots: Math.max(1, Math.floor(abs / lotMult)) };
+
   return { units:'lots', lots: Math.max(1, Math.round(abs)) };
+}
+
+// ✅ Get close side + position lots from LIVE position (fixes wrong TP side)
+async function getPositionCloseSideAndLots(psym){
+  const sym = safeUpper(toProductSymbol(psym));
+  const pos = await listPositionsArray();
+  const row = pos.find(p => safeUpper(p?.product_symbol || p?.symbol) === sym);
+
+  const rawSize = Number(row?.size || row?.position_size || 0);
+  if (!rawSize || Math.abs(rawSize) < 1e-12) {
+    return { hasPos:false, closeSide:null, lots:0, rawSize:0, row:null };
+  }
+
+  const lotMult = await getLotMult(sym);
+  const inferred = await inferPositionUnits({ psym: sym, rawSize, lotMult, posRow: row });
+
+  const closeSide = rawSize > 0 ? 'sell' : 'buy';
+  return { hasPos:true, closeSide, lots: inferred.lots, rawSize, row };
 }
 
 // ---------- order helpers ----------
@@ -435,7 +447,6 @@ async function learnLotMultFromPositions(psym){
     if (!row) return;
 
     const lotMultMeta = await getLotMult(psym);
-
     const rawSize = Number(row.size||row.position_size||0);
     const inferred = await inferPositionUnits({ psym, rawSize, lotMult: lotMultMeta, posRow: row });
 
@@ -454,20 +465,9 @@ async function learnLotMultFromPositions(psym){
 
       if (Math.abs(learned - lotMultMeta) / Math.max(1, lotMultMeta) < 0.5) {
         setCachedLotMult(psym, learned);
-        console.log('learned lot multiplier', {
-          product_symbol: psym,
-          learned,
-          coinsAbs,
-          lotsSent,
-          inferred_units: inferred.units
-        });
+        console.log('learned lot multiplier', { product_symbol: psym, learned, coinsAbs, lotsSent, inferred_units: inferred.units });
       } else {
-        console.log('learn rejected (conflicts with meta)', {
-          psym,
-          learned,
-          lotMultMeta,
-          inferred_units: inferred.units
-        });
+        console.log('learn rejected (conflicts with meta)', { psym, learned, lotMultMeta, inferred_units: inferred.units });
       }
 
       LAST_ENTRY_SENT.delete(psym);
@@ -475,40 +475,79 @@ async function learnLotMultFromPositions(psym){
   } catch {}
 }
 
+// ✅ Decide allowed max lots from (amount * leverage) if amount present
+async function maxLotsFromMsgBudget(m, product_symbol, lotMult){
+  const fxHint   = nnum(m.fxQuoteToINR || m.fx_quote_to_inr || m.fx || FX_INR_FALLBACK, FX_INR_FALLBACK);
+  const leverage = Math.max(1, Math.floor(nnum(m.leverage || m.leverage_x || DEFAULT_LEVERAGE, DEFAULT_LEVERAGE)));
+  const ccy      = String(m.amount_ccy || m.ccy || (typeof m.amount_usd !== 'undefined' ? 'USD' : 'INR')).toUpperCase();
+
+  // Amount detection
+  let amount = null;
+  if (typeof m.amount_inr !== 'undefined') amount = nnum(m.amount_inr, 0);
+  else if (typeof m.amount_usd !== 'undefined') amount = nnum(m.amount_usd, 0);
+  else if (typeof m.order_amount !== 'undefined') amount = nnum(m.order_amount, 0);
+  else if (typeof m.amount !== 'undefined') amount = nnum(m.amount, 0);
+
+  if (!(amount > 0)) return null; // no budget info in msg
+
+  // Price
+  let entryPxUSD = nnum(m.entry, 0);
+  if (!(entryPxUSD > 0)) entryPxUSD = nnum(await getTickerPriceUSD(product_symbol), 0);
+  if (!(entryPxUSD > 0)) return null;
+
+  const lots = lotsFromAmount({ amount, ccy, leverage, entryPxUSD, lotMult, fxInrPerUsd: fxHint });
+  return clamp(lots, 1, MAX_LOTS_PER_ORDER);
+}
+
 async function placeEntry(m){
   const side = (m.side||'').toLowerCase()==='buy' ? 'buy' : 'sell';
   const product_symbol = toProductSymbol(m.symbol || m.product_symbol);
-
   const lotMult = await getLotMult(product_symbol);
 
+  // Incoming qty may be present
   let sizeLots = parseInt(m.qty,10);
   let usedMode = 'qty';
 
-  if (!sizeLots || sizeLots < 1) {
-    const fxHint   = nnum(m.fxQuoteToINR || m.fx_quote_to_inr || m.fx || FX_INR_FALLBACK, FX_INR_FALLBACK);
-    const leverage = Math.max(1, Math.floor(nnum(m.leverage || m.leverage_x || DEFAULT_LEVERAGE, DEFAULT_LEVERAGE)));
-    const ccy      = String(m.amount_ccy || m.ccy || (typeof m.amount_usd !== 'undefined' ? 'USD' : 'INR')).toUpperCase();
+  // ✅ If budget is present, clamp qty to not exceed amount*leverage sizing
+  const budgetMaxLots = await maxLotsFromMsgBudget(m, product_symbol, lotMult);
+  if (Number.isFinite(budgetMaxLots) && budgetMaxLots > 0) {
+    if (!sizeLots || sizeLots < 1) {
+      sizeLots = budgetMaxLots;
+      usedMode = 'amount_budget';
+    } else {
+      const before = sizeLots;
+      sizeLots = Math.min(sizeLots, budgetMaxLots);
+      usedMode = (sizeLots !== before) ? 'qty_clamped_to_budget' : 'qty_within_budget';
+    }
+  } else {
+    // If no qty and no budget, try classic amount-based sizing if amount is provided
+    if (!sizeLots || sizeLots < 1) {
+      const fxHint   = nnum(m.fxQuoteToINR || m.fx_quote_to_inr || m.fx || FX_INR_FALLBACK, FX_INR_FALLBACK);
+      const leverage = Math.max(1, Math.floor(nnum(m.leverage || m.leverage_x || DEFAULT_LEVERAGE, DEFAULT_LEVERAGE)));
+      const ccy      = String(m.amount_ccy || m.ccy || (typeof m.amount_usd !== 'undefined' ? 'USD' : 'INR')).toUpperCase();
 
-    let entryPxUSD = nnum(m.entry, 0);
-    if (!(entryPxUSD > 0)) entryPxUSD = nnum(await getTickerPriceUSD(product_symbol), 0);
-    if (!(entryPxUSD > 0)) throw new Error(`No price available for ${product_symbol}`);
+      let entryPxUSD = nnum(m.entry, 0);
+      if (!(entryPxUSD > 0)) entryPxUSD = nnum(await getTickerPriceUSD(product_symbol), 0);
+      if (!(entryPxUSD > 0)) throw new Error(`No price available for ${product_symbol}`);
 
-    let amount = undefined;
-    if (typeof m.amount_inr   !== 'undefined') amount = nnum(m.amount_inr, 0);
-    else if (typeof m.amount_usd !== 'undefined') amount = nnum(m.amount_usd, 0);
-    else if (typeof m.order_amount !== 'undefined') amount = nnum(m.order_amount, 0);
-    else if (typeof m.amount !== 'undefined') amount = nnum(m.amount, 0);
-    if (!(amount > 0)) throw new Error('Amount-based entry requires amount_inr/amount_usd/order_amount/amount');
+      let amount = undefined;
+      if (typeof m.amount_inr   !== 'undefined') amount = nnum(m.amount_inr, 0);
+      else if (typeof m.amount_usd !== 'undefined') amount = nnum(m.amount_usd, 0);
+      else if (typeof m.order_amount !== 'undefined') amount = nnum(m.order_amount, 0);
+      else if (typeof m.amount !== 'undefined') amount = nnum(m.amount, 0);
 
-    sizeLots = lotsFromAmount({ amount, ccy, leverage, entryPxUSD, lotMult, fxInrPerUsd: fxHint });
-    usedMode = `${ccy==='USD'?'amount_usd':'amount_inr'}`;
+      if (!(amount > 0)) throw new Error('Entry requires qty OR amount_inr/amount_usd/order_amount/amount');
 
-    console.log('amount sizing debug', { product_symbol, amount, ccy, leverage, entryPxUSD, lotMult, sizeLots });
+      sizeLots = lotsFromAmount({ amount, ccy, leverage, entryPxUSD, lotMult, fxInrPerUsd: fxHint });
+      usedMode = `${ccy==='USD'?'amount_usd':'amount_inr'}`;
+
+      console.log('amount sizing debug', { product_symbol, amount, ccy, leverage, entryPxUSD, lotMult, sizeLots });
+    }
   }
 
   sizeLots = clamp(sizeLots, 1, MAX_LOTS_PER_ORDER);
 
-  console.log('entry size normalization', { product_symbol, side, lotMult, usedMode, sizeLots });
+  console.log('entry size normalization', { product_symbol, side, lotMult, usedMode, sizeLots, budgetMaxLots });
 
   const out = await dcall('POST','/v2/orders',{
     product_symbol,
@@ -526,9 +565,7 @@ async function placeEntry(m){
 // -------------------- TP SIZE NORMALIZATION (FIX) --------------------
 function normalizeTpSizeLots({ psym, lotMult, order, lastEntry }) {
   const coins = nnum(order?.size_coins ?? order?.coins, 0);
-  if (coins > 0) {
-    return Math.max(1, Math.floor(coins / lotMult));
-  }
+  if (coins > 0) return Math.max(1, Math.floor(coins / lotMult));
 
   const s = nnum(order?.size, 0);
   if (!(s > 0)) return 0;
@@ -537,21 +574,10 @@ function normalizeTpSizeLots({ psym, lotMult, order, lastEntry }) {
   const lastLots = lastEntry?.lots ? nnum(lastEntry.lots, 0) : 0;
   const lastCoins = (lastLots > 0) ? (lastLots * lotMult) : 0;
 
-  if (sInt && lastLots > 0 && s <= Math.max(lastLots, 1) * 2) {
-    return Math.max(1, Math.round(s));
-  }
-
-  if (lastCoins > 0 && s >= Math.max(lastCoins * 0.5, lotMult * 2)) {
-    return Math.max(1, Math.floor(s / lotMult));
-  }
-
-  if (lotMult > 1 && sInt && (s % lotMult) !== 0) {
-    return Math.max(1, Math.round(s));
-  }
-
-  if (lotMult > 1 && s > MAX_LOTS_PER_ORDER) {
-    return Math.max(1, Math.floor(s / lotMult));
-  }
+  if (sInt && lastLots > 0 && s <= Math.max(lastLots, 1) * 2) return Math.max(1, Math.round(s));
+  if (lastCoins > 0 && s >= Math.max(lastCoins * 0.5, lotMult * 2)) return Math.max(1, Math.floor(s / lotMult));
+  if (lotMult > 1 && sInt && (s % lotMult) !== 0) return Math.max(1, Math.round(s));
+  if (lotMult > 1 && s > MAX_LOTS_PER_ORDER) return Math.max(1, Math.floor(s / lotMult));
 
   if (lotMult > 1) {
     if (sInt && s <= 5000) return Math.max(1, Math.round(s));
@@ -561,15 +587,53 @@ function normalizeTpSizeLots({ psym, lotMult, order, lastEntry }) {
   return Math.max(1, Math.round(s));
 }
 
-// ✅ Delta client_order_id max len = 32 => generate short deterministic-ish ID
+// ✅ Delta client_order_id max len = 32 => short hash ID
 function shortClientOrderId(sigId, psym, idx){
   const base = `${String(sigId||'')}|${String(psym||'')}|TP|${idx}|${Date.now()}`;
   const h = crypto.createHash('sha1').update(base).digest('hex'); // 40 chars
   const p = String(psym || '').toUpperCase().replace(/[^A-Z0-9]/g,'').slice(0,6);
-  // Format: "T" + idx(1-2 chars) + p(<=6) + "_" + 22 hex = <= 32
   return `T${idx}${p}_${h.slice(0,22)}`.slice(0,32);
 }
 
+// ✅ Clamp batch TP lots to position lots (prevents over-close)
+function clampBatchLotsToPosition(preOrders, positionLots){
+  if (!(positionLots > 0)) return preOrders;
+
+  const sum = preOrders.reduce((a,x)=>a + (x.sizeLots||0), 0);
+  if (sum <= positionLots) return preOrders;
+
+  const scale = positionLots / sum;
+
+  let scaled = preOrders.map(o => ({
+    ...o,
+    sizeLots: Math.max(1, Math.floor(o.sizeLots * scale))
+  }));
+
+  let newSum = scaled.reduce((a,x)=>a + x.sizeLots, 0);
+
+  let i = 0;
+  while (newSum < positionLots && scaled.length) {
+    scaled[i % scaled.length].sizeLots += 1;
+    newSum += 1;
+    i++;
+    if (i > 10000) break;
+  }
+
+  i = 0;
+  while (newSum > positionLots && scaled.length) {
+    const idx = i % scaled.length;
+    if (scaled[idx].sizeLots > 1) {
+      scaled[idx].sizeLots -= 1;
+      newSum -= 1;
+    }
+    i++;
+    if (i > 10000) break;
+  }
+
+  return scaled;
+}
+
+// ✅ placeBatch: TP side forced from live position + TP lots clamped to position lots
 async function placeBatch(m){
   const psym =
     toProductSymbol(m.product_symbol || m.symbol) ||
@@ -582,56 +646,58 @@ async function placeBatch(m){
     (await getProductIdBySymbol(psym));
 
   if (!pid) throw new Error(`placeBatch: could not resolve product_id for ${psym}`);
-
-  if (!Array.isArray(m.orders) || !m.orders.length) {
-    throw new Error('placeBatch: missing orders[]');
-  }
+  if (!Array.isArray(m.orders) || !m.orders.length) throw new Error('placeBatch: missing orders[]');
 
   const lotMult = await getLotMult(psym);
-  const lastSide = LAST_SIDE.get(psym) || null;
   const sigId = String(m.sig_id || m.signal_id || 'nosig');
-
   const lastEntry = LAST_ENTRY_SENT.get(psym) || null;
 
-  const orders = m.orders.slice(0, 50).map((o, idx) => {
+  // ✅ Force side from LIVE position
+  const posInfo = await getPositionCloseSideAndLots(psym);
+  if (!posInfo.hasPos) throw new Error(`placeBatch: no open position for ${psym} (skip reduce-only TPs)`);
+
+  const tpSide = posInfo.closeSide;          // short => buy, long => sell
+  const positionLots = posInfo.lots;
+
+  // 1) build pre-orders with computed lots
+  let pre = m.orders.slice(0, 50).map((o, idx) => {
     const oo = { ...o };
 
     const sizeLots = normalizeTpSizeLots({ psym, lotMult, order: oo, lastEntry });
     if (!sizeLots) throw new Error(`placeBatch: bad size on order #${idx}`);
 
-    if (lastSide) {
-      if (!oo.side) oo.side = oppositeSide(lastSide);
-      else {
-        const s = String(oo.side).toLowerCase();
-        if (s === lastSide) oo.side = oppositeSide(lastSide);
-      }
-    }
-
-    if (!oo.order_type) oo.order_type = 'limit_order';
-    if (typeof oo.reduce_only === 'undefined') oo.reduce_only = true;
-
     if (!oo.limit_price && (oo.price || oo.lmt_price)) oo.limit_price = oo.price || oo.lmt_price;
     if (typeof oo.limit_price !== 'undefined') oo.limit_price = String(oo.limit_price);
+    if (!oo.limit_price) throw new Error(`placeBatch: missing limit_price on order #${idx}`);
 
-    // ✅ FIX: client_order_id <= 32
     if (!oo.client_order_id) oo.client_order_id = shortClientOrderId(sigId, psym, idx);
     oo.client_order_id = String(oo.client_order_id).slice(0, 32);
 
-    const cleaned = {
+    return {
+      idx,
       limit_price: oo.limit_price,
-      size: Math.max(1, parseInt(sizeLots, 10)),
-      side: String(oo.side || '').toLowerCase(),
-      order_type: oo.order_type || 'limit_order',
-      reduce_only: !!oo.reduce_only,
-      client_order_id: oo.client_order_id
+      sizeLots: Math.max(1, parseInt(sizeLots, 10)),
+      client_order_id: oo.client_order_id,
+      post_only: (typeof oo.post_only !== 'undefined') ? !!oo.post_only : undefined,
+      mmp: (typeof oo.mmp !== 'undefined') ? !!oo.mmp : undefined
     };
+  });
 
-    if (!cleaned.limit_price) throw new Error(`placeBatch: missing limit_price on order #${idx}`);
-    if (!cleaned.side || !['buy','sell'].includes(cleaned.side)) throw new Error(`placeBatch: missing/invalid side on order #${idx}`);
+  // 2) clamp to position lots
+  pre = clampBatchLotsToPosition(pre, positionLots);
 
-    if (typeof oo.post_only !== 'undefined') cleaned.post_only = !!oo.post_only;
-    if (typeof oo.mmp !== 'undefined') cleaned.mmp = !!oo.mmp;
-
+  // 3) final payload: forced tpSide + reduce_only true
+  const orders = pre.map(x => {
+    const cleaned = {
+      limit_price: x.limit_price,
+      size: Math.max(1, parseInt(x.sizeLots, 10)),
+      side: tpSide,
+      order_type: 'limit_order',
+      reduce_only: true,
+      client_order_id: x.client_order_id
+    };
+    if (typeof x.post_only !== 'undefined') cleaned.post_only = x.post_only;
+    if (typeof x.mmp !== 'undefined') cleaned.mmp = x.mmp;
     return cleaned;
   });
 
@@ -639,17 +705,13 @@ async function placeBatch(m){
     psym,
     pid,
     lotMult,
-    lastSide,
-    lastEntry: lastEntry ? { lots: lastEntry.lots, side: lastEntry.side, tsAgoMs: Date.now()-lastEntry.ts } : null,
+    positionLots,
+    tpSide,
+    sumLots: orders.reduce((a,o)=>a+Number(o.size||0),0),
     first3: orders.slice(0,3)
   });
 
-  const body = {
-    product_id: pid,
-    product_symbol: psym,
-    orders
-  };
-
+  const body = { product_id: pid, product_symbol: psym, orders };
   const r = await dcall('POST','/v2/orders/batch', body);
 
   console.log('BATCH_TPS result', {
@@ -678,9 +740,7 @@ async function cancelOrder({ id, client_order_id, product_id, product_symbol }){
   if (!pid) throw new Error(`cancelOrder: missing product_id (id=${id}, client_order_id=${client_order_id}, product_symbol=${product_symbol})`);
   payload.product_id = pid;
 
-  if (!payload.id && !payload.client_order_id) {
-    return { ok:true, skipped:true, reason:'missing_id_and_client_order_id' };
-  }
+  if (!payload.id && !payload.client_order_id) return { ok:true, skipped:true, reason:'missing_id_and_client_order_id' };
   return dcall('DELETE', '/v2/orders', payload);
 }
 

@@ -11,6 +11,9 @@
 // 2) Safer lotMult meta picking (prioritizes lot_size/contract_size/contract_value/contract_unit)
 // 3) Learning fallback improved (learn coinsPerLot from positions)
 //
+// ✅ NEW BEST FIX INCLUDED:
+// 4) closePositionBySymbol() no longer guesses coins vs lots incorrectly for 1lot=100/1000 coins
+//
 // ⚠️ Cloud Run: Use Max instances = 1 (and ideally concurrency = 1) OR store state in Redis/Firestore.
 
 require('dotenv').config();
@@ -643,7 +646,8 @@ async function listPositionsArray(){
   return [];
 }
 
-// ✅ close position correctly even if Delta returns size in LOTS/contracts
+// ✅ BEST FIX: close position without guessing "rawSize is lots" for 100/1000-lot coins.
+// Always convert using lotMult when lotMult > 1 (those are the problematic contracts).
 async function closePositionBySymbol(symbolOrProductSymbol){
   const psym = toProductSymbol(symbolOrProductSymbol);
   if (!psym) throw new Error('closePositionBySymbol: missing symbol/product_symbol');
@@ -657,22 +661,22 @@ async function closePositionBySymbol(symbolOrProductSymbol){
     return { ok:true, skipped:true, reason:'no_position' };
   }
 
-  const looksLikeLots =
-    Number.isFinite(rawSize) &&
-    Math.abs(rawSize) <= MAX_LOTS_PER_ORDER &&
-    Math.abs(rawSize - Math.round(rawSize)) < 1e-9;
+  const lotMult = await getLotMult(psym);
+  const abs = Math.abs(rawSize);
 
   let lots;
-  if (looksLikeLots) {
-    lots = Math.max(1, Math.abs(Math.round(rawSize)));
+  if (lotMult > 1) {
+    // For 100/1000-lot contracts, positions often come back in COINS.
+    lots = Math.max(1, Math.floor((abs / lotMult) + 1e-12));
   } else {
-    const lotMult = await getLotMult(psym);
-    const absCoins = Math.abs(rawSize);
-    lots = Math.max(1, Math.ceil((absCoins / lotMult) - 1e-12));
+    // For lotMult=1 or fractional contracts, rawSize is usually already lots/contracts.
+    lots = Math.max(1, Math.round(abs));
   }
 
+  lots = clamp(lots, 1, MAX_LOTS_PER_ORDER);
+
   const side = rawSize > 0 ? 'sell' : 'buy';
-  console.log('closePositionBySymbol:', { psym, rawSize, looksLikeLots, lots, side });
+  console.log('closePositionBySymbol:', { psym, rawSize, lotMult, lots, side });
 
   return dcall('POST','/v2/orders',{
     product_symbol: psym,

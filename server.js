@@ -9,6 +9,8 @@
 //  7) ✅ TP SIDE FIX: TP side forced from LIVE POSITION (short => buy, long => sell) (not LAST_SIDE / Pine)
 //  8) ✅ TP SIZE CLAMP: total TP lots clamped to current position lots
 //  9) ✅ ENTRY SAFETY: even if Pine sends qty, we clamp qty to what your (base amount * leverage) allows
+// 10) ✅ TP COINS-vs-LOTS FIX for lotMult 100/1000: treats divisible sizes as COINS
+// 11) ✅ TP LEG DROP FIX: if positionLots < TP legs, drop extra legs (prevents reverse position)
 //
 // STRICT sequencing: expects CANCAL(seq0) -> ENTER(seq1) -> BATCH_TPS(seq2)
 //
@@ -564,6 +566,7 @@ async function placeEntry(m){
 
 // -------------------- TP SIZE NORMALIZATION (FIX) --------------------
 function normalizeTpSizeLots({ psym, lotMult, order, lastEntry }) {
+  // If webhook explicitly provides coins, trust it
   const coins = nnum(order?.size_coins ?? order?.coins, 0);
   if (coins > 0) return Math.max(1, Math.floor(coins / lotMult));
 
@@ -574,16 +577,27 @@ function normalizeTpSizeLots({ psym, lotMult, order, lastEntry }) {
   const lastLots = lastEntry?.lots ? nnum(lastEntry.lots, 0) : 0;
   const lastCoins = (lastLots > 0) ? (lastLots * lotMult) : 0;
 
-  if (sInt && lastLots > 0 && s <= Math.max(lastLots, 1) * 2) return Math.max(1, Math.round(s));
-  if (lastCoins > 0 && s >= Math.max(lastCoins * 0.5, lotMult * 2)) return Math.max(1, Math.floor(s / lotMult));
-  if (lotMult > 1 && sInt && (s % lotMult) !== 0) return Math.max(1, Math.round(s));
-  if (lotMult > 1 && s > MAX_LOTS_PER_ORDER) return Math.max(1, Math.floor(s / lotMult));
-
-  if (lotMult > 1) {
-    if (sInt && s <= 5000) return Math.max(1, Math.round(s));
+  // ✅ CRITICAL FIX:
+  // For lotMult like 100 / 1000, TradingView/Pine often sends size as COINS.
+  // If size is divisible by lotMult and >= lotMult, treat it as COINS.
+  if (lotMult > 1 && sInt && s >= lotMult && (s % lotMult) === 0) {
     return Math.max(1, Math.floor(s / lotMult));
   }
 
+  // If it looks like LOTS (small integer relative to last entry lots), treat as LOTS
+  if (sInt && lastLots > 0 && s <= Math.max(lastLots, 1) * 2) return Math.max(1, Math.round(s));
+
+  // If it looks like COINS compared to last entry coins
+  if (lastCoins > 0 && s >= Math.max(lastCoins * 0.5, lotMult * 2)) return Math.max(1, Math.floor(s / lotMult));
+
+  // If integer but not divisible by lotMult, likely already LOTS
+  if (lotMult > 1 && sInt && (s % lotMult) !== 0) return Math.max(1, Math.round(s));
+
+  // Giant numbers are likely COINS
+  if (lotMult > 1 && s > MAX_LOTS_PER_ORDER) return Math.max(1, Math.floor(s / lotMult));
+
+  // Final fallback
+  if (lotMult > 1) return Math.max(1, Math.round(s));
   return Math.max(1, Math.round(s));
 }
 
@@ -596,8 +610,18 @@ function shortClientOrderId(sigId, psym, idx){
 }
 
 // ✅ Clamp batch TP lots to position lots (prevents over-close)
+// ✅ LEG DROP FIX: if positionLots < number of TP legs, drop extra legs
 function clampBatchLotsToPosition(preOrders, positionLots){
   if (!(positionLots > 0)) return preOrders;
+
+  // If we have fewer lots than TP legs, we cannot place 1-lot-per-leg.
+  // Keep only the first `positionLots` legs, each with 1 lot.
+  if (positionLots < preOrders.length) {
+    return preOrders.slice(0, positionLots).map(o => ({
+      ...o,
+      sizeLots: 1
+    }));
+  }
 
   const sum = preOrders.reduce((a,x)=>a + (x.sizeLots||0), 0);
   if (sum <= positionLots) return preOrders;
@@ -683,7 +707,7 @@ async function placeBatch(m){
     };
   });
 
-  // 2) clamp to position lots
+  // 2) clamp to position lots (and drop legs if needed)
   pre = clampBatchLotsToPosition(pre, positionLots);
 
   // 3) final payload: forced tpSide + reduce_only true
@@ -701,15 +725,22 @@ async function placeBatch(m){
     return cleaned;
   });
 
+  const sumLots = orders.reduce((a,o)=>a+Number(o.size||0),0);
+
   console.log('BATCH_TPS placing', {
     psym,
     pid,
     lotMult,
     positionLots,
     tpSide,
-    sumLots: orders.reduce((a,o)=>a+Number(o.size||0),0),
+    sumLots,
     first3: orders.slice(0,3)
   });
+
+  // ✅ Hard safety: never allow total TP lots to exceed position lots
+  if (sumLots > positionLots) {
+    throw new Error(`TP safety: refusing to place sumLots=${sumLots} > positionLots=${positionLots} for ${psym}`);
+  }
 
   const body = { product_id: pid, product_symbol: psym, orders };
   const r = await dcall('POST','/v2/orders/batch', body);

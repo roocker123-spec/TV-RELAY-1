@@ -1,20 +1,16 @@
-// server.js (FULL) — LOTS sizing + STRICT chain + TP batch booking (FIXED)
-// ✅ Fixes included:
-//  1) Robust lotMult parsing ("10 ARC", "0.1 LINK", "1000 PEPE"...)
-//  2) inferPositionUnits(): detects if positions API size is LOTS or COINS
-//  3) closePositionBySymbol(): always closes correct lots
-//  4) TP booking: correct batch payload + strong TP size normalization (prevents double-dividing)
-//  5) ✅ client_order_id <= 32 chars (Delta validation) via hash-based short ID
-//  6) ✅ FIX orders pagination: Delta uses cursor pagination (after/page_size), not page/per_page
-//  7) ✅ TP SIDE FIX: TP side forced from LIVE POSITION (short => buy, long => sell) (not LAST_SIDE / Pine)
-//  8) ✅ TP SIZE CLAMP: total TP lots clamped to current position lots
-//  9) ✅ ENTRY SAFETY: even if Pine sends qty, we clamp qty to what your (base amount * leverage) allows
-// 10) ✅ TP COINS-vs-LOTS FIX for lotMult 100/1000: treats divisible sizes as COINS
-// 11) ✅ TP LEG DROP FIX: if positionLots < TP legs, drop extra legs (prevents reverse position)
+// server.js (FULL) — LOTS sizing + STRICT chain + TP batch booking + PROTECTIVE SL/TRAIL
+// ✅ Existing fixes preserved
+// ✅ Added:
+//   1) PLACE_SL_INTENT
+//   2) TRAIL_SL_INTENT
+//   3) CANCEL_PROTECTIVE
+//   4) waits for live position before placing protection
+//   5) cancels only old protective orders before replacing SL/trailing
 //
-// STRICT sequencing: expects CANCAL(seq0) -> ENTER(seq1) -> BATCH_TPS(seq2)
+// STRICT sequencing remains ONLY for:
+//   CANCAL(seq0) -> ENTER(seq1) -> BATCH_TPS(seq2)
 //
-// ⚠️ Cloud Run: best max instances=1 and concurrency=1 unless you persist CHAIN/SEEN in Redis/DB.
+// Protection actions are handled OUTSIDE strict seq chain.
 
 require('dotenv').config();
 const express = require('express');
@@ -32,7 +28,7 @@ function parseNum(v){
   if (v === null || typeof v === 'undefined') return null;
   if (typeof v === 'number' && Number.isFinite(v)) return v;
   const s = String(v).trim();
-  const m = s.match(/-?\d+(\.\d+)?/); // extract first number
+  const m = s.match(/-?\d+(\.\d+)?/);
   if (!m) return null;
   const n = Number(m[0]);
   return Number.isFinite(n) ? n : null;
@@ -40,8 +36,8 @@ function parseNum(v){
 
 function toProductSymbol(sym){
   if(!sym) return sym;
-  let s = String(sym).replace('.P','');           // remove TradingView .P suffix if present
-  if(s.includes(':')) s = s.split(':').pop();     // remove prefix like BINANCE:
+  let s = String(sym).replace('.P','');
+  if(s.includes(':')) s = s.split(':').pop();
   return s;
 }
 function isScopeAll(msg){
@@ -51,12 +47,17 @@ function safeUpper(x){ return String(x||'').toUpperCase(); }
 function sigKey(sigId, psym){ return `${String(sigId||'')}|${safeUpper(psym||'')}`; }
 function oppositeSide(side){ return (String(side||'').toLowerCase()==='buy') ? 'sell' : 'buy'; }
 
+// ---------- protection helpers ----------
+function protectiveKey(psym){
+  return `PROTECT:${safeUpper(toProductSymbol(psym || ''))}`;
+}
+
 // ---------- queue (serializes webhook execution) ----------
 const QUEUE = new Map(); // key -> Promise chain
 function enqueue(key, fn) {
   const prev = QUEUE.get(key) || Promise.resolve();
   const next = prev
-    .catch(() => {})          // keep chain alive even if prev errored
+    .catch(() => {})
     .then(fn)
     .finally(() => {
       if (QUEUE.get(key) === next) QUEUE.delete(key);
@@ -91,10 +92,10 @@ app.use((req, _res, next) => {
 const API_KEY       = process.env.DELTA_API_KEY || '';
 const API_SECRET    = process.env.DELTA_API_SECRET || '';
 const BASE_URL      = (process.env.DELTA_BASE || process.env.DELTA_BASE_URL || 'https://api.india.delta.exchange').replace(/\/+$/,'');
-const WEBHOOK_TOKEN = process.env.WEBHOOK_TOKEN || ''; // optional header check
+const WEBHOOK_TOKEN = process.env.WEBHOOK_TOKEN || '';
 const PORT          = process.env.PORT || 3000;
 
-const AUTH_MODE     = (process.env.DELTA_AUTH || 'hmac').toLowerCase(); // 'hmac' | 'keyonly'
+const AUTH_MODE     = (process.env.DELTA_AUTH || 'hmac').toLowerCase();
 const HDR_API_KEY   = process.env.DELTA_HDR_API_KEY || 'api-key';
 const HDR_SIG       = process.env.DELTA_HDR_SIG     || 'signature';
 const HDR_TS        = process.env.DELTA_HDR_TS      || 'timestamp';
@@ -113,10 +114,8 @@ const FAST_ENTER = String(process.env.FAST_ENTER || 'false').toLowerCase() === '
 const FAST_ENTER_WAIT_MS  = nnum(process.env.FAST_ENTER_WAIT_MS, 2000);
 const FAST_ENTER_RETRY_MS = nnum(process.env.FAST_ENTER_RETRY_MS, 8000);
 
-// ---------- STRICT sequence (default ON) ----------
+// ---------- STRICT sequence ----------
 const STRICT_SEQUENCE = String(process.env.STRICT_SEQUENCE || 'true').toLowerCase() !== 'false';
-
-// ✅ raise default to 120s; still override via env
 const SIGNAL_CHAIN_WINDOW_MS = nnum(process.env.SIGNAL_CHAIN_WINDOW_MS, 120_000);
 
 const AUTO_CANCEL_ON_ENTER = String(process.env.AUTO_CANCEL_ON_ENTER || 'false').toLowerCase() === 'true';
@@ -124,6 +123,11 @@ const AUTO_CANCEL_ON_ENTER = String(process.env.AUTO_CANCEL_ON_ENTER || 'false')
 // Defaults for cancel step ONLY
 const FORCE_CANCEL_ORDERS_ON_CANCEL = String(process.env.FORCE_CANCEL_ORDERS_ON_CANCEL || 'true').toLowerCase() !== 'false';
 const FORCE_CLOSE_ON_CANCEL         = String(process.env.FORCE_CLOSE_ON_CANCEL || 'true').toLowerCase() !== 'false';
+
+// ---------- protection / stop management ----------
+const POSITION_WAIT_MS   = nnum(process.env.POSITION_WAIT_MS, 12000);
+const POSITION_POLL_MS   = nnum(process.env.POSITION_POLL_MS, 350);
+const PROTECTIVE_PREFIX  = String(process.env.PROTECTIVE_PREFIX || 'PRT');
 
 // ---------- idempotency ----------
 const SEEN = new Map();
@@ -285,7 +289,7 @@ async function getProductIdBySymbol(psym){
   return Number.isFinite(+pid) ? +pid : null;
 }
 
-const LOT_MULT_CACHE = new Map(); // product_symbol -> { m, ts }
+const LOT_MULT_CACHE = new Map();
 
 function lotMultiplierFromMeta(meta){
   const candidates = [
@@ -390,7 +394,6 @@ async function listPositionsArray(){
   return [];
 }
 
-// ✅ infer whether position.size is LOTS or COINS
 async function inferPositionUnits({ psym, rawSize, lotMult, posRow }){
   const abs = Math.abs(Number(rawSize || 0));
   if (!(abs > 0)) return { units: 'unknown', lots: 0 };
@@ -409,15 +412,12 @@ async function inferPositionUnits({ psym, rawSize, lotMult, posRow }){
   }
 
   if (lotMult > 1 && Number.isInteger(abs) && (abs % lotMult) !== 0) return { units:'lots', lots: Math.max(1, Math.round(abs)) };
-
   if (lotMult > 1 && abs > MAX_LOTS_PER_ORDER) return { units:'coins', lots: Math.max(1, Math.floor(abs / lotMult)) };
-
   if (lotMult > 1) return { units:'coins', lots: Math.max(1, Math.floor(abs / lotMult)) };
 
   return { units:'lots', lots: Math.max(1, Math.round(abs)) };
 }
 
-// ✅ Get close side + position lots from LIVE position (fixes wrong TP side)
 async function getPositionCloseSideAndLots(psym){
   const sym = safeUpper(toProductSymbol(psym));
   const pos = await listPositionsArray();
@@ -436,9 +436,8 @@ async function getPositionCloseSideAndLots(psym){
 }
 
 // ---------- order helpers ----------
-const LAST_ENTRY_SENT = new Map(); // psym -> { lots, ts, side, lotMult }
+const LAST_ENTRY_SENT = new Map();
 
-// ✅ learning: uses inferred position units so it doesn't learn wrong cache
 async function learnLotMultFromPositions(psym){
   const last = LAST_ENTRY_SENT.get(psym);
   if (!last || (Date.now()-last.ts) > 15_000) return;
@@ -477,22 +476,19 @@ async function learnLotMultFromPositions(psym){
   } catch {}
 }
 
-// ✅ Decide allowed max lots from (amount * leverage) if amount present
 async function maxLotsFromMsgBudget(m, product_symbol, lotMult){
   const fxHint   = nnum(m.fxQuoteToINR || m.fx_quote_to_inr || m.fx || FX_INR_FALLBACK, FX_INR_FALLBACK);
   const leverage = Math.max(1, Math.floor(nnum(m.leverage || m.leverage_x || DEFAULT_LEVERAGE, DEFAULT_LEVERAGE)));
   const ccy      = String(m.amount_ccy || m.ccy || (typeof m.amount_usd !== 'undefined' ? 'USD' : 'INR')).toUpperCase();
 
-  // Amount detection
   let amount = null;
   if (typeof m.amount_inr !== 'undefined') amount = nnum(m.amount_inr, 0);
   else if (typeof m.amount_usd !== 'undefined') amount = nnum(m.amount_usd, 0);
   else if (typeof m.order_amount !== 'undefined') amount = nnum(m.order_amount, 0);
   else if (typeof m.amount !== 'undefined') amount = nnum(m.amount, 0);
 
-  if (!(amount > 0)) return null; // no budget info in msg
+  if (!(amount > 0)) return null;
 
-  // Price
   let entryPxUSD = nnum(m.entry, 0);
   if (!(entryPxUSD > 0)) entryPxUSD = nnum(await getTickerPriceUSD(product_symbol), 0);
   if (!(entryPxUSD > 0)) return null;
@@ -506,11 +502,9 @@ async function placeEntry(m){
   const product_symbol = toProductSymbol(m.symbol || m.product_symbol);
   const lotMult = await getLotMult(product_symbol);
 
-  // Incoming qty may be present
   let sizeLots = parseInt(m.qty,10);
   let usedMode = 'qty';
 
-  // ✅ If budget is present, clamp qty to not exceed amount*leverage sizing
   const budgetMaxLots = await maxLotsFromMsgBudget(m, product_symbol, lotMult);
   if (Number.isFinite(budgetMaxLots) && budgetMaxLots > 0) {
     if (!sizeLots || sizeLots < 1) {
@@ -522,7 +516,6 @@ async function placeEntry(m){
       usedMode = (sizeLots !== before) ? 'qty_clamped_to_budget' : 'qty_within_budget';
     }
   } else {
-    // If no qty and no budget, try classic amount-based sizing if amount is provided
     if (!sizeLots || sizeLots < 1) {
       const fxHint   = nnum(m.fxQuoteToINR || m.fx_quote_to_inr || m.fx || FX_INR_FALLBACK, FX_INR_FALLBACK);
       const leverage = Math.max(1, Math.floor(nnum(m.leverage || m.leverage_x || DEFAULT_LEVERAGE, DEFAULT_LEVERAGE)));
@@ -564,9 +557,8 @@ async function placeEntry(m){
   return out;
 }
 
-// -------------------- TP SIZE NORMALIZATION (FIX) --------------------
+// -------------------- TP SIZE NORMALIZATION --------------------
 function normalizeTpSizeLots({ psym, lotMult, order, lastEntry }) {
-  // If webhook explicitly provides coins, trust it
   const coins = nnum(order?.size_coins ?? order?.coins, 0);
   if (coins > 0) return Math.max(1, Math.floor(coins / lotMult));
 
@@ -577,45 +569,41 @@ function normalizeTpSizeLots({ psym, lotMult, order, lastEntry }) {
   const lastLots = lastEntry?.lots ? nnum(lastEntry.lots, 0) : 0;
   const lastCoins = (lastLots > 0) ? (lastLots * lotMult) : 0;
 
-  // ✅ CRITICAL FIX:
-  // For lotMult like 100 / 1000, TradingView/Pine often sends size as COINS.
-  // If size is divisible by lotMult and >= lotMult, treat it as COINS.
   if (lotMult > 1 && sInt && s >= lotMult && (s % lotMult) === 0) {
     return Math.max(1, Math.floor(s / lotMult));
   }
 
-  // If it looks like LOTS (small integer relative to last entry lots), treat as LOTS
   if (sInt && lastLots > 0 && s <= Math.max(lastLots, 1) * 2) return Math.max(1, Math.round(s));
-
-  // If it looks like COINS compared to last entry coins
   if (lastCoins > 0 && s >= Math.max(lastCoins * 0.5, lotMult * 2)) return Math.max(1, Math.floor(s / lotMult));
-
-  // If integer but not divisible by lotMult, likely already LOTS
   if (lotMult > 1 && sInt && (s % lotMult) !== 0) return Math.max(1, Math.round(s));
-
-  // Giant numbers are likely COINS
   if (lotMult > 1 && s > MAX_LOTS_PER_ORDER) return Math.max(1, Math.floor(s / lotMult));
 
-  // Final fallback
   if (lotMult > 1) return Math.max(1, Math.round(s));
   return Math.max(1, Math.round(s));
 }
 
-// ✅ Delta client_order_id max len = 32 => short hash ID
 function shortClientOrderId(sigId, psym, idx){
   const base = `${String(sigId||'')}|${String(psym||'')}|TP|${idx}|${Date.now()}`;
-  const h = crypto.createHash('sha1').update(base).digest('hex'); // 40 chars
+  const h = crypto.createHash('sha1').update(base).digest('hex');
   const p = String(psym || '').toUpperCase().replace(/[^A-Z0-9]/g,'').slice(0,6);
   return `T${idx}${p}_${h.slice(0,22)}`.slice(0,32);
 }
 
-// ✅ Clamp batch TP lots to position lots (prevents over-close)
-// ✅ LEG DROP FIX: if positionLots < number of TP legs, drop extra legs
+function protectiveClientOrderId(kind, sigId, psym){
+  const base = `${PROTECTIVE_PREFIX}|${kind}|${String(sigId||'')}|${String(psym||'')}|${Date.now()}`;
+  const h = crypto.createHash('sha1').update(base).digest('hex');
+  const p = String(psym || '').toUpperCase().replace(/[^A-Z0-9]/g,'').slice(0,6);
+  return `${PROTECTIVE_PREFIX}_${kind}_${p}_${h.slice(0,12)}`.slice(0,32);
+}
+
+function isProtectiveOrder(o){
+  const cid = String(o?.client_order_id || '');
+  return cid.startsWith(`${PROTECTIVE_PREFIX}_`);
+}
+
 function clampBatchLotsToPosition(preOrders, positionLots){
   if (!(positionLots > 0)) return preOrders;
 
-  // If we have fewer lots than TP legs, we cannot place 1-lot-per-leg.
-  // Keep only the first `positionLots` legs, each with 1 lot.
   if (positionLots < preOrders.length) {
     return preOrders.slice(0, positionLots).map(o => ({
       ...o,
@@ -657,7 +645,6 @@ function clampBatchLotsToPosition(preOrders, positionLots){
   return scaled;
 }
 
-// ✅ placeBatch: TP side forced from live position + TP lots clamped to position lots
 async function placeBatch(m){
   const psym =
     toProductSymbol(m.product_symbol || m.symbol) ||
@@ -676,14 +663,12 @@ async function placeBatch(m){
   const sigId = String(m.sig_id || m.signal_id || 'nosig');
   const lastEntry = LAST_ENTRY_SENT.get(psym) || null;
 
-  // ✅ Force side from LIVE position
   const posInfo = await getPositionCloseSideAndLots(psym);
   if (!posInfo.hasPos) throw new Error(`placeBatch: no open position for ${psym} (skip reduce-only TPs)`);
 
-  const tpSide = posInfo.closeSide;          // short => buy, long => sell
+  const tpSide = posInfo.closeSide;
   const positionLots = posInfo.lots;
 
-  // 1) build pre-orders with computed lots
   let pre = m.orders.slice(0, 50).map((o, idx) => {
     const oo = { ...o };
 
@@ -707,10 +692,8 @@ async function placeBatch(m){
     };
   });
 
-  // 2) clamp to position lots (and drop legs if needed)
   pre = clampBatchLotsToPosition(pre, positionLots);
 
-  // 3) final payload: forced tpSide + reduce_only true
   const orders = pre.map(x => {
     const cleaned = {
       limit_price: x.limit_price,
@@ -737,7 +720,6 @@ async function placeBatch(m){
     first3: orders.slice(0,3)
   });
 
-  // ✅ Hard safety: never allow total TP lots to exceed position lots
   if (sumLots > positionLots) {
     throw new Error(`TP safety: refusing to place sumLots=${sumLots} > positionLots=${positionLots} for ${psym}`);
   }
@@ -759,7 +741,6 @@ async function placeBatch(m){
 const cancelAllOrders   = () => dcall('DELETE','/v2/orders/all');
 const closeAllPositions = () => dcall('POST','/v2/positions/close_all', {});
 
-// Correct cancel endpoint is DELETE /v2/orders with body {id, product_id}
 async function cancelOrder({ id, client_order_id, product_id, product_symbol }){
   const payload = {};
   if (Number.isFinite(+id)) payload.id = +id;
@@ -775,7 +756,6 @@ async function cancelOrder({ id, client_order_id, product_id, product_symbol }){
   return dcall('DELETE', '/v2/orders', payload);
 }
 
-// ✅ FIXED pagination (cursor-based): after + page_size
 async function listOpenOrdersAllPages(){
   let all = [];
   let after = null;
@@ -838,7 +818,43 @@ async function cancelOrdersBySymbol(psym, { fallbackAll=false } = {}){
   return { ok:true, cancelled, failed, symbol: sym };
 }
 
-// ✅ closePositionBySymbol: uses inferPositionUnits()
+async function cancelProtectiveOrdersBySymbol(psym){
+  const sym = toProductSymbol(psym);
+  if (!sym) return { ok:true, skipped:true, reason:'missing_symbol' };
+
+  let open = [];
+  try {
+    open = await listOpenOrdersAllPages();
+  } catch(e) {
+    throw new Error(`cancelProtectiveOrdersBySymbol list failed: ${e?.message || e}`);
+  }
+
+  const mine = open.filter(o =>
+    safeUpper(o?.product_symbol || o?.symbol) === safeUpper(sym) &&
+    isProtectiveOrder(o)
+  );
+
+  if (!mine.length) {
+    return { ok:true, skipped:true, reason:'no_protective_orders', symbol:sym };
+  }
+
+  let cancelled = 0, failed = 0;
+  for (const o of mine){
+    const oid  = o?.id ?? o?.order_id;
+    const pid  = o?.product_id;
+    const coid = o?.client_order_id;
+    try {
+      await cancelOrder({ id: oid, client_order_id: coid, product_id: pid, product_symbol: sym });
+      cancelled++;
+    } catch(e){
+      failed++;
+      console.warn('cancelProtectiveOrdersBySymbol failed', { sym, oid, coid, err: e?.message || e });
+    }
+  }
+
+  return { ok:true, cancelled, failed, symbol:sym };
+}
+
 async function closePositionBySymbol(symbolOrProductSymbol){
   const psym = toProductSymbol(symbolOrProductSymbol);
   if (!psym) throw new Error('closePositionBySymbol: missing symbol/product_symbol');
@@ -931,6 +947,20 @@ async function isFlatNowSymbol(psym){
 
     return !hasOrders && !hasPos;
   } catch { return false; }
+}
+
+async function waitUntilPositionSymbol(psym, timeoutMs = POSITION_WAIT_MS, pollMs = POSITION_POLL_MS){
+  const sym = toProductSymbol(psym);
+  const end = Date.now() + timeoutMs;
+
+  while (Date.now() < end) {
+    try {
+      const info = await getPositionCloseSideAndLots(sym);
+      if (info?.hasPos && info?.lots > 0) return info;
+    } catch(e) {}
+    await sleep(pollMs);
+  }
+  return null;
 }
 
 // ----- Flatten helper for CANCAL (seq0) -----
@@ -1062,6 +1092,103 @@ async function preflightFromEnterMsg(enterMsg, psym){
   return steps;
 }
 
+// ---------- protection actions ----------
+async function placeSLIntent(m){
+  const psym = toProductSymbol(m.symbol || m.product_symbol);
+  if (!psym) throw new Error('placeSLIntent: missing symbol/product_symbol');
+
+  const info = await waitUntilPositionSymbol(psym);
+  if (!info || !info.hasPos || !(info.lots > 0)) {
+    throw new Error(`placeSLIntent: no live position found for ${psym}`);
+  }
+
+  const stopPrice = nnum(m.stop_price, 0);
+  if (!(stopPrice > 0)) throw new Error(`placeSLIntent: invalid stop_price for ${psym}`);
+
+  await cancelProtectiveOrdersBySymbol(psym);
+
+  const client_order_id = protectiveClientOrderId('SL', m.sig_id || m.signal_id, psym);
+
+  const body = {
+    product_symbol: psym,
+    order_type: m.order_type || 'market_order',
+    side: info.closeSide,
+    size: info.lots,
+    reduce_only: true,
+    stop_order_type: m.stop_order_type || 'stop_loss_order',
+    stop_price: String(stopPrice),
+    client_order_id
+  };
+
+  console.log('PLACE_SL_INTENT placing', {
+    psym,
+    closeSide: info.closeSide,
+    lots: info.lots,
+    stopPrice,
+    client_order_id
+  });
+
+  const r = await dcall('POST', '/v2/orders', body);
+  return { ok:true, action:'PLACE_SL_INTENT', symbol:psym, lots:info.lots, closeSide:info.closeSide, stopPrice, r };
+}
+
+async function placeTrailIntent(m){
+  const psym = toProductSymbol(m.symbol || m.product_symbol);
+  if (!psym) throw new Error('placeTrailIntent: missing symbol/product_symbol');
+
+  const info = await waitUntilPositionSymbol(psym);
+  if (!info || !info.hasPos || !(info.lots > 0)) {
+    throw new Error(`placeTrailIntent: no live position found for ${psym}`);
+  }
+
+  const trailAmount = nnum(m.trail_amount, 0);
+  if (!(trailAmount > 0)) throw new Error(`placeTrailIntent: invalid trail_amount for ${psym}`);
+
+  await cancelProtectiveOrdersBySymbol(psym);
+
+  const client_order_id = protectiveClientOrderId('TRL', m.sig_id || m.signal_id, psym);
+
+  const body = {
+    product_symbol: psym,
+    order_type: m.order_type || 'market_order',
+    side: info.closeSide,
+    size: info.lots,
+    reduce_only: true,
+    stop_order_type: m.stop_order_type || 'trailing_stop_order',
+    trail_amount: String(trailAmount),
+    client_order_id
+  };
+
+  console.log('TRAIL_SL_INTENT placing', {
+    psym,
+    closeSide: info.closeSide,
+    lots: info.lots,
+    trailAmount,
+    mode: m.trail_mode || 'ACTIVATE',
+    client_order_id
+  });
+
+  const r = await dcall('POST', '/v2/orders', body);
+  return {
+    ok:true,
+    action:'TRAIL_SL_INTENT',
+    symbol:psym,
+    lots:info.lots,
+    closeSide:info.closeSide,
+    trailAmount,
+    mode:m.trail_mode || 'ACTIVATE',
+    r
+  };
+}
+
+async function cancelProtectiveIntent(m){
+  const psym = toProductSymbol(m.symbol || m.product_symbol);
+  if (!psym) throw new Error('cancelProtectiveIntent: missing symbol/product_symbol');
+
+  const r = await cancelProtectiveOrdersBySymbol(psym);
+  return { ok:true, action:'CANCEL_PROTECTIVE', symbol:psym, ...r };
+}
+
 // ---------- health ----------
 app.get('/health', (_req,res)=>res.json({ok:true, started_at:process.env.__STARTED_AT}));
 app.get('/healthz', (_req,res)=>res.send('ok'));
@@ -1104,7 +1231,10 @@ app.post('/tv', async (req, res) => {
     console.log('\n=== INCOMING /tv ===');
     console.log(JSON.stringify({ action, sigId, seq, symTV, psym, ts: new Date().toISOString() }));
 
-    const qKey = isScopeAll(msg) ? 'GLOBAL' : `SYM:${safeUpper(psym)}`;
+    const qKey =
+      action === 'PLACE_SL_INTENT' || action === 'TRAIL_SL_INTENT' || action === 'CANCEL_PROTECTIVE'
+        ? protectiveKey(psym)
+        : (isScopeAll(msg) ? 'GLOBAL' : `SYM:${safeUpper(psym)}`);
 
     const out = await enqueue(qKey, async () => {
 
@@ -1114,6 +1244,18 @@ app.post('/tv', async (req, res) => {
 
       if (action === 'EXIT') return { ok:true, ignored:'EXIT' };
 
+      // ---------- protection actions (OUTSIDE strict seq0/1/2 chain) ----------
+      if (action === 'PLACE_SL_INTENT') {
+        return await placeSLIntent(msg);
+      }
+      if (action === 'TRAIL_SL_INTENT') {
+        return await placeTrailIntent(msg);
+      }
+      if (action === 'CANCEL_PROTECTIVE') {
+        return await cancelProtectiveIntent(msg);
+      }
+
+      // ---------- strict chain only for entry workflow ----------
       if (STRICT_SEQUENCE) {
         if (!sigId) return { ok:true, ignored:'missing_sig_id_in_strict_mode', action, symbol: psym };
         if (!Number.isFinite(seq)) return { ok:true, ignored:'missing_or_invalid_seq_in_strict_mode', sig_id: sigId, action, symbol: psym };

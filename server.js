@@ -1095,6 +1095,12 @@ async function preflightFromEnterMsg(enterMsg, psym){
 // ---------- protection actions ----------
 async function placeSLIntent(m){
   const psym = toProductSymbol(m.symbol || m.product_symbol);
+  console.log('PLACE_SL_INTENT received', {
+  sig_id: m.sig_id || m.signal_id,
+  symbol: m.symbol || m.product_symbol,
+  stop_price: m.stop_price
+});
+  
   if (!psym) throw new Error('placeSLIntent: missing symbol/product_symbol');
 
   const info = await waitUntilPositionSymbol(psym);
@@ -1134,7 +1140,14 @@ async function placeSLIntent(m){
 
 async function placeTrailIntent(m){
   const psym = toProductSymbol(m.symbol || m.product_symbol);
+  console.log('TRAIL_SL_INTENT received', {
+  sig_id: m.sig_id || m.signal_id,
+  symbol: m.symbol || m.product_symbol,
+  trail_amount: m.trail_amount,
+  mode: m.trail_mode
+});
   if (!psym) throw new Error('placeTrailIntent: missing symbol/product_symbol');
+  
 
   const info = await waitUntilPositionSymbol(psym);
   if (!info || !info.hasPos || !(info.lots > 0)) {
@@ -1183,6 +1196,10 @@ async function placeTrailIntent(m){
 
 async function cancelProtectiveIntent(m){
   const psym = toProductSymbol(m.symbol || m.product_symbol);
+  console.log('CANCEL_PROTECTIVE received', {
+  sig_id: m.sig_id || m.signal_id,
+  symbol: m.symbol || m.product_symbol
+});
   if (!psym) throw new Error('cancelProtectiveIntent: missing symbol/product_symbol');
 
   const r = await cancelProtectiveOrdersBySymbol(psym);
@@ -1420,3 +1437,4 @@ app.post('/tv', async (req, res) => {
 app.listen(PORT, ()=>console.log(
   `Relay listening http://localhost:${PORT} (BASE=${BASE_URL}, AUTH=${AUTH_MODE}, STRICT_SEQUENCE=${STRICT_SEQUENCE}, FAST_ENTER=${FAST_ENTER}, SIGNAL_CHAIN_WINDOW_MS=${SIGNAL_CHAIN_WINDOW_MS}, AUTO_CANCEL_ON_ENTER=${AUTO_CANCEL_ON_ENTER}, FORCE_CLOSE_ON_CANCEL=${FORCE_CLOSE_ON_CANCEL})`
 ));
+

@@ -1,4 +1,4 @@
-// server.js (FULL) — LOTS sizing + STRICT chain + TP batch booking + PROTECTIVE SL/TRAIL
+// server.js (FULL) — LOTS sizing + STRICT chain + TP ladder one-by-one + PROTECTIVE SL/TRAIL
 // ✅ Existing fixes preserved
 // ✅ Added:
 //   1) PLACE_SL_INTENT
@@ -6,6 +6,8 @@
 //   3) CANCEL_PROTECTIVE
 //   4) waits for live position before placing protection
 //   5) cancels only old protective orders before replacing SL/trailing
+//   6) TP ladder now places ONE-BY-ONE via /v2/orders (not /v2/orders/batch)
+//   7) cancels old TP/protective orders before placing fresh TP ladder
 //
 // STRICT sequencing remains ONLY for:
 //   CANCAL(seq0) -> ENTER(seq1) -> BATCH_TPS(seq2)
@@ -601,6 +603,20 @@ function isProtectiveOrder(o){
   return cid.startsWith(`${PROTECTIVE_PREFIX}_`);
 }
 
+function isTpLikeOrder(o){
+  const cid = String(o?.client_order_id || '');
+  return (
+    cid.startsWith('T0') ||
+    cid.startsWith('T1') ||
+    cid.startsWith('T2') ||
+    cid.startsWith('T3') ||
+    cid.startsWith('T4') ||
+    cid.startsWith('T5') ||
+    cid.startsWith('TP') ||
+    cid.startsWith(`${PROTECTIVE_PREFIX}_`)
+  );
+}
+
 function clampBatchLotsToPosition(preOrders, positionLots){
   if (!(positionLots > 0)) return preOrders;
 
@@ -645,18 +661,49 @@ function clampBatchLotsToPosition(preOrders, positionLots){
   return scaled;
 }
 
+async function cancelTpAndProtectiveOrdersBySymbol(psym){
+  const sym = toProductSymbol(psym);
+  if (!sym) return { ok:true, skipped:true, reason:'missing_symbol' };
+
+  let open = [];
+  try {
+    open = await listOpenOrdersAllPages();
+  } catch(e) {
+    throw new Error(`cancelTpAndProtectiveOrdersBySymbol list failed: ${e?.message || e}`);
+  }
+
+  const mine = open.filter(o =>
+    safeUpper(o?.product_symbol || o?.symbol) === safeUpper(sym) &&
+    isTpLikeOrder(o)
+  );
+
+  if (!mine.length) {
+    return { ok:true, skipped:true, reason:'no_tp_or_protective_orders', symbol:sym };
+  }
+
+  let cancelled = 0, failed = 0;
+  for (const o of mine){
+    const oid  = o?.id ?? o?.order_id;
+    const pid  = o?.product_id;
+    const coid = o?.client_order_id;
+    try {
+      await cancelOrder({ id: oid, client_order_id: coid, product_id: pid, product_symbol: sym });
+      cancelled++;
+    } catch(e){
+      failed++;
+      console.warn('cancelTpAndProtectiveOrdersBySymbol failed', { sym, oid, coid, err: e?.message || e });
+    }
+  }
+
+  return { ok:true, cancelled, failed, symbol:sym };
+}
+
 async function placeBatch(m){
   const psym =
     toProductSymbol(m.product_symbol || m.symbol) ||
     toProductSymbol(m?.orders?.[0]?.product_symbol);
 
   if (!psym) throw new Error('placeBatch: missing product_symbol/symbol');
-
-  const pid =
-    (Number.isFinite(+m.product_id) ? +m.product_id : null) ||
-    (await getProductIdBySymbol(psym));
-
-  if (!pid) throw new Error(`placeBatch: could not resolve product_id for ${psym}`);
   if (!Array.isArray(m.orders) || !m.orders.length) throw new Error('placeBatch: missing orders[]');
 
   const lotMult = await getLotMult(psym);
@@ -664,10 +711,12 @@ async function placeBatch(m){
   const lastEntry = LAST_ENTRY_SENT.get(psym) || null;
 
   const posInfo = await getPositionCloseSideAndLots(psym);
-  if (!posInfo.hasPos) throw new Error(`placeBatch: no open position for ${psym} (skip reduce-only TPs)`);
+  if (!posInfo.hasPos) throw new Error(`placeBatch: no open position for ${psym}`);
 
   const tpSide = posInfo.closeSide;
   const positionLots = posInfo.lots;
+
+  await cancelTpAndProtectiveOrdersBySymbol(psym);
 
   let pre = m.orders.slice(0, 50).map((o, idx) => {
     const oo = { ...o };
@@ -694,47 +743,91 @@ async function placeBatch(m){
 
   pre = clampBatchLotsToPosition(pre, positionLots);
 
-  const orders = pre.map(x => {
-    const cleaned = {
-      limit_price: x.limit_price,
-      size: Math.max(1, parseInt(x.sizeLots, 10)),
-      side: tpSide,
-      order_type: 'limit_order',
-      reduce_only: true,
-      client_order_id: x.client_order_id
-    };
-    if (typeof x.post_only !== 'undefined') cleaned.post_only = x.post_only;
-    if (typeof x.mmp !== 'undefined') cleaned.mmp = x.mmp;
-    return cleaned;
-  });
+  const sumLots = pre.reduce((a,o)=>a + Number(o.sizeLots || 0), 0);
 
-  const sumLots = orders.reduce((a,o)=>a+Number(o.size||0),0);
-
-  console.log('BATCH_TPS placing', {
+  console.log('TP ladder placing one-by-one', {
     psym,
-    pid,
     lotMult,
     positionLots,
     tpSide,
     sumLots,
-    first3: orders.slice(0,3)
+    first3: pre.slice(0,3)
   });
 
   if (sumLots > positionLots) {
     throw new Error(`TP safety: refusing to place sumLots=${sumLots} > positionLots=${positionLots} for ${psym}`);
   }
 
-  const body = { product_id: pid, product_symbol: psym, orders };
-  const r = await dcall('POST','/v2/orders/batch', body);
+  const placed = [];
+  const failed = [];
 
-  console.log('BATCH_TPS result', {
+  for (const x of pre) {
+    const body = {
+      product_symbol: psym,
+      order_type: 'limit_order',
+      side: tpSide,
+      size: x.sizeLots,
+      limit_price: x.limit_price,
+      reduce_only: true,
+      time_in_force: 'gtc',
+      client_order_id: x.client_order_id
+    };
+
+    if (typeof x.post_only !== 'undefined') body.post_only = x.post_only;
+    if (typeof x.mmp !== 'undefined') body.mmp = x.mmp;
+
+    try {
+      const r = await dcall('POST', '/v2/orders', body);
+
+      console.log('TP single placed raw', {
+        psym,
+        idx: x.idx,
+        request: body,
+        response: r?.result || r
+      });
+
+      placed.push({
+        idx: x.idx,
+        size: x.sizeLots,
+        limit_price: x.limit_price,
+        client_order_id: x.client_order_id,
+        result: r?.result || r
+      });
+    } catch (e) {
+      console.warn('TP single place failed', {
+        psym,
+        idx: x.idx,
+        size: x.sizeLots,
+        limit_price: x.limit_price,
+        client_order_id: x.client_order_id,
+        err: e?.message || e
+      });
+
+      failed.push({
+        idx: x.idx,
+        size: x.sizeLots,
+        limit_price: x.limit_price,
+        client_order_id: x.client_order_id,
+        error: String(e?.message || e)
+      });
+    }
+
+    await sleep(120);
+  }
+
+  console.log('TP ladder one-by-one result', {
     psym,
-    success: r?.success,
-    keys: Object.keys(r || {}),
-    sample: (Array.isArray(r?.result) ? r.result.slice(0,2) : null)
+    placed: placed.length,
+    failed: failed.length,
+    placed_first3: placed.slice(0, 3),
+    failed_first3: failed.slice(0, 3)
   });
 
-  return r;
+  if (!placed.length) {
+    throw new Error(`placeBatch: all TP placements failed for ${psym}`);
+  }
+
+  return { ok:true, mode:'single_orders', placed, failed };
 }
 
 // ---------- CANCEL/CLOSE ----------
@@ -1096,11 +1189,11 @@ async function preflightFromEnterMsg(enterMsg, psym){
 async function placeSLIntent(m){
   const psym = toProductSymbol(m.symbol || m.product_symbol);
   console.log('PLACE_SL_INTENT received', {
-  sig_id: m.sig_id || m.signal_id,
-  symbol: m.symbol || m.product_symbol,
-  stop_price: m.stop_price
-});
-  
+    sig_id: m.sig_id || m.signal_id,
+    symbol: m.symbol || m.product_symbol,
+    stop_price: m.stop_price
+  });
+
   if (!psym) throw new Error('placeSLIntent: missing symbol/product_symbol');
 
   const info = await waitUntilPositionSymbol(psym);
@@ -1141,13 +1234,13 @@ async function placeSLIntent(m){
 async function placeTrailIntent(m){
   const psym = toProductSymbol(m.symbol || m.product_symbol);
   console.log('TRAIL_SL_INTENT received', {
-  sig_id: m.sig_id || m.signal_id,
-  symbol: m.symbol || m.product_symbol,
-  trail_amount: m.trail_amount,
-  mode: m.trail_mode
-});
+    sig_id: m.sig_id || m.signal_id,
+    symbol: m.symbol || m.product_symbol,
+    trail_amount: m.trail_amount,
+    mode: m.trail_mode
+  });
+
   if (!psym) throw new Error('placeTrailIntent: missing symbol/product_symbol');
-  
 
   const info = await waitUntilPositionSymbol(psym);
   if (!info || !info.hasPos || !(info.lots > 0)) {
@@ -1197,9 +1290,10 @@ async function placeTrailIntent(m){
 async function cancelProtectiveIntent(m){
   const psym = toProductSymbol(m.symbol || m.product_symbol);
   console.log('CANCEL_PROTECTIVE received', {
-  sig_id: m.sig_id || m.signal_id,
-  symbol: m.symbol || m.product_symbol
-});
+    sig_id: m.sig_id || m.signal_id,
+    symbol: m.symbol || m.product_symbol
+  });
+
   if (!psym) throw new Error('cancelProtectiveIntent: missing symbol/product_symbol');
 
   const r = await cancelProtectiveOrdersBySymbol(psym);
@@ -1437,4 +1531,3 @@ app.post('/tv', async (req, res) => {
 app.listen(PORT, ()=>console.log(
   `Relay listening http://localhost:${PORT} (BASE=${BASE_URL}, AUTH=${AUTH_MODE}, STRICT_SEQUENCE=${STRICT_SEQUENCE}, FAST_ENTER=${FAST_ENTER}, SIGNAL_CHAIN_WINDOW_MS=${SIGNAL_CHAIN_WINDOW_MS}, AUTO_CANCEL_ON_ENTER=${AUTO_CANCEL_ON_ENTER}, FORCE_CLOSE_ON_CANCEL=${FORCE_CLOSE_ON_CANCEL})`
 ));
-

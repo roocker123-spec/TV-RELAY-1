@@ -8,6 +8,7 @@
 //   5) cancels only old protective orders before replacing SL/trailing
 //   6) TP ladder now places ONE-BY-ONE via /v2/orders (not /v2/orders/batch)
 //   7) cancels old TP/protective orders before placing fresh TP ladder
+//   8) CLOSE_SL — candle-close confirmed SL (software SL from Pine)
 //
 // STRICT sequencing remains ONLY for:
 //   CANCAL(seq0) -> ENTER(seq1) -> BATCH_TPS(seq2)
@@ -1300,6 +1301,82 @@ async function cancelProtectiveIntent(m){
   return { ok:true, action:'CANCEL_PROTECTIVE', symbol:psym, ...r };
 }
 
+// ===================== NEW: CLOSE_SL (candle-close confirmed SL) ===================== //
+// Pine sends this when candle CLOSES past SL + buffer + volume confirmed.
+// Steps: 1) cancel ALL open orders for symbol (TPs + protective)
+//        2) close position with market order
+async function closeSLIntent(m){
+  const psym = toProductSymbol(m.symbol || m.product_symbol);
+  const sigId = m.sig_id || m.signal_id || '';
+  const reason = m.reason || 'SOFTWARE_SL';
+  const closePrice = nnum(m.close_price, 0);
+
+  console.log('CLOSE_SL received', {
+    sig_id: sigId,
+    symbol: psym,
+    reason,
+    close_price: closePrice
+  });
+
+  if (!psym) throw new Error('closeSLIntent: missing symbol/product_symbol');
+
+  // Step 1: Cancel ALL open orders for this symbol (TPs + protective SL/trail)
+  let cancelResult = null;
+  try {
+    cancelResult = await cancelOrdersBySymbol(psym, { fallbackAll: false });
+    console.log('CLOSE_SL cancel orders done', { psym, cancelResult });
+  } catch (e) {
+    console.warn('CLOSE_SL cancel orders failed, continuing to close position', { psym, err: e?.message || e });
+  }
+
+  // Step 2: Close the position with a market order
+  const posInfo = await getPositionCloseSideAndLots(psym);
+  if (!posInfo.hasPos || !(posInfo.lots > 0)) {
+    console.log('CLOSE_SL: no open position found, may already be closed', { psym });
+    return {
+      ok: true,
+      action: 'CLOSE_SL',
+      symbol: psym,
+      reason,
+      close_price: closePrice,
+      position_found: false,
+      cancel_result: cancelResult,
+      note: 'No position found — may already be closed by emergency stop or TP fills'
+    };
+  }
+
+  const closeBody = {
+    product_symbol: psym,
+    order_type: 'market_order',
+    side: posInfo.closeSide,
+    size: posInfo.lots,
+    reduce_only: true
+  };
+
+  console.log('CLOSE_SL closing position', {
+    psym,
+    closeSide: posInfo.closeSide,
+    lots: posInfo.lots,
+    reason,
+    close_price: closePrice
+  });
+
+  const closeResult = await dcall('POST', '/v2/orders', closeBody);
+
+  return {
+    ok: true,
+    action: 'CLOSE_SL',
+    symbol: psym,
+    reason,
+    close_price: closePrice,
+    position_found: true,
+    closeSide: posInfo.closeSide,
+    lots: posInfo.lots,
+    cancel_result: cancelResult,
+    close_result: closeResult?.result || closeResult
+  };
+}
+
 // ---------- health ----------
 app.get('/health', (_req,res)=>res.json({ok:true, started_at:process.env.__STARTED_AT}));
 app.get('/healthz', (_req,res)=>res.send('ok'));
@@ -1343,7 +1420,7 @@ app.post('/tv', async (req, res) => {
     console.log(JSON.stringify({ action, sigId, seq, symTV, psym, ts: new Date().toISOString() }));
 
     const qKey =
-      action === 'PLACE_SL_INTENT' || action === 'TRAIL_SL_INTENT' || action === 'CANCEL_PROTECTIVE'
+      action === 'PLACE_SL_INTENT' || action === 'TRAIL_SL_INTENT' || action === 'CANCEL_PROTECTIVE' || action === 'CLOSE_SL'
         ? protectiveKey(psym)
         : (isScopeAll(msg) ? 'GLOBAL' : `SYM:${safeUpper(psym)}`);
 
@@ -1364,6 +1441,10 @@ app.post('/tv', async (req, res) => {
       }
       if (action === 'CANCEL_PROTECTIVE') {
         return await cancelProtectiveIntent(msg);
+      }
+      // ✅ NEW: CLOSE_SL — candle-close confirmed SL from Pine Script
+      if (action === 'CLOSE_SL') {
+        return await closeSLIntent(msg);
       }
 
       // ---------- strict chain only for entry workflow ----------

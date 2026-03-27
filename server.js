@@ -128,7 +128,7 @@ const FORCE_CANCEL_ORDERS_ON_CANCEL = String(process.env.FORCE_CANCEL_ORDERS_ON_
 const FORCE_CLOSE_ON_CANCEL         = String(process.env.FORCE_CLOSE_ON_CANCEL || 'true').toLowerCase() !== 'false';
 
 // ---------- protection / stop management ----------
-const POSITION_WAIT_MS   = nnum(process.env.POSITION_WAIT_MS, 12000);
+const POSITION_WAIT_MS   = nnum(process.env.POSITION_WAIT_MS, 30000);
 const POSITION_POLL_MS   = nnum(process.env.POSITION_POLL_MS, 350);
 const PROTECTIVE_PREFIX  = String(process.env.PROTECTIVE_PREFIX || 'PRT');
 
@@ -1420,7 +1420,7 @@ app.post('/tv', async (req, res) => {
     console.log(JSON.stringify({ action, sigId, seq, symTV, psym, ts: new Date().toISOString() }));
 
     const qKey =
-      action === 'PLACE_SL_INTENT' || action === 'TRAIL_SL_INTENT' || action === 'CANCEL_PROTECTIVE' || action === 'CLOSE_SL'
+      action === 'CANCEL_PROTECTIVE' || action === 'CLOSE_SL'
         ? protectiveKey(psym)
         : (isScopeAll(msg) ? 'GLOBAL' : `SYM:${safeUpper(psym)}`);
 

@@ -882,7 +882,7 @@ async function listOpenOrdersAllPages(){
   return all;
 }
 
-async function cancelOrdersBySymbol(psym, { fallbackAll=false } = {}){
+async function cancelOrdersBySymbol(psym, { fallbackAll=false, skipProtective=false } = {}){
   const sym = toProductSymbol(psym);
   if (!sym) return { ok:true, skipped:true, reason:'missing_symbol' };
 
@@ -893,7 +893,10 @@ async function cancelOrdersBySymbol(psym, { fallbackAll=false } = {}){
     throw e;
   }
 
-  const mine = open.filter(o => safeUpper(o?.product_symbol||o?.symbol) === safeUpper(sym));
+  const mine = open.filter(o =>
+    safeUpper(o?.product_symbol||o?.symbol) === safeUpper(sym) &&
+    (!skipProtective || !isProtectiveOrder(o))
+  );
   if (!mine.length) return { ok:true, skipped:true, reason:'no_open_orders_for_symbol', symbol: sym };
 
   let cancelled = 0, failed = 0;
@@ -1095,8 +1098,8 @@ async function flattenFromCancelMsg(cancelMsg, psym){
         await cancelAllOrders();
         steps.cancel_mode = 'cancel_all_orders';
       } else {
-        await cancelOrdersBySymbol(psym, { fallbackAll: cancelFallbackAll });
-        steps.cancel_mode = 'cancel_symbol_orders';
+        await cancelOrdersBySymbol(psym, { fallbackAll: cancelFallbackAll, skipProtective: true });
+        steps.cancel_mode = 'cancel_symbol_orders_skip_protective';
       }
       steps.cancel_orders = true;
     } catch (e) {

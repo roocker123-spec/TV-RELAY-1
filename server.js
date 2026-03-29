@@ -1305,7 +1305,6 @@ async function placeTrailIntent(m){
     size: info.lots,
     reduce_only: true,
     stop_order_type: 'stop_loss_order',
-    stop_price: String(stopPrice),
     trail_amount: String(trailAmount),
     stop_trigger_method: 'last_traded_price',
     client_order_id

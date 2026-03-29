@@ -1204,7 +1204,13 @@ async function placeSLIntent(m){
 
   if (!psym) throw new Error('placeSLIntent: missing symbol/product_symbol');
 
-  const info = await waitUntilPositionSymbol(psym);
+  // Wait for entry chain to clear old position first
+  // Without this, we find the OLD position, place SL, then CANCAL deletes it
+  console.log(`placeSLIntent: waiting 10s for entry chain to clear old orders/position...`);
+  await sleep(10000);
+
+  // Now wait for the NEW position to appear (up to 50s total: 10s sleep + 40s poll)
+  const info = await waitUntilPositionSymbol(psym, 40000);
   if (!info || !info.hasPos || !(info.lots > 0)) {
     throw new Error(`placeSLIntent: no live position found for ${psym}`);
   }
@@ -1250,7 +1256,12 @@ async function placeTrailIntent(m){
 
   if (!psym) throw new Error('placeTrailIntent: missing symbol/product_symbol');
 
-  const info = await waitUntilPositionSymbol(psym);
+  // Wait for entry chain to clear old position first
+  console.log(`placeTrailIntent: waiting 10s for entry chain to clear old orders/position...`);
+  await sleep(10000);
+
+  // Now wait for the NEW position to appear
+  const info = await waitUntilPositionSymbol(psym, 40000);
   if (!info || !info.hasPos || !(info.lots > 0)) {
     throw new Error(`placeTrailIntent: no live position found for ${psym}`);
   }

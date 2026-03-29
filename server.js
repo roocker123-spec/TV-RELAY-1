@@ -1258,26 +1258,48 @@ async function placeTrailIntent(m){
   const trailAmount = nnum(m.trail_amount, 0);
   if (!(trailAmount > 0)) throw new Error(`placeTrailIntent: invalid trail_amount for ${psym}`);
 
+  // Get current mark price to calculate stop price
+  const markPrice = nnum(info.row?.mark_price || info.row?.last_price, 0);
+  let currentPrice = markPrice;
+  if (!(currentPrice > 0)) {
+    currentPrice = nnum(await getTickerPriceUSD(psym), 0);
+  }
+  if (!(currentPrice > 0)) throw new Error(`placeTrailIntent: cannot get current price for ${psym}`);
+
+  // Delta India doesn't support trailing_stop_order
+  // Convert trail_amount to a fixed stop_loss_order price:
+  //   LONG position (closeSide=sell): stop = currentPrice - trailAmount
+  //   SHORT position (closeSide=buy): stop = currentPrice + trailAmount
+  const isLong = info.closeSide === 'sell';
+  const stopPrice = isLong
+    ? currentPrice - trailAmount
+    : currentPrice + trailAmount;
+
+  if (!(stopPrice > 0)) throw new Error(`placeTrailIntent: calculated stopPrice=${stopPrice} invalid for ${psym}`);
+
   await cancelProtectiveOrdersBySymbol(psym);
 
   const client_order_id = protectiveClientOrderId('TRL', m.sig_id || m.signal_id, psym);
 
   const body = {
     product_symbol: psym,
-    order_type: m.order_type || 'market_order',
+    order_type: 'market_order',
     side: info.closeSide,
     size: info.lots,
     reduce_only: true,
-    stop_order_type: m.stop_order_type || 'trailing_stop_order',
-    trail_amount: String(trailAmount),
+    stop_order_type: 'stop_loss_order',
+    stop_price: String(stopPrice),
     client_order_id
   };
 
-  console.log('TRAIL_SL_INTENT placing', {
+  console.log('TRAIL_SL_INTENT placing as stop_loss_order', {
     psym,
     closeSide: info.closeSide,
     lots: info.lots,
+    isLong,
+    currentPrice,
     trailAmount,
+    stopPrice,
     mode: m.trail_mode || 'ACTIVATE',
     client_order_id
   });
@@ -1290,11 +1312,12 @@ async function placeTrailIntent(m){
     lots:info.lots,
     closeSide:info.closeSide,
     trailAmount,
+    stopPrice,
+    currentPrice,
     mode:m.trail_mode || 'ACTIVATE',
     r
   };
 }
-
 async function cancelProtectiveIntent(m){
   const psym = toProductSymbol(m.symbol || m.product_symbol);
   console.log('CANCEL_PROTECTIVE received', {

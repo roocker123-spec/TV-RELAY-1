@@ -1258,7 +1258,7 @@ async function placeTrailIntent(m){
   const trailAmount = nnum(m.trail_amount, 0);
   if (!(trailAmount > 0)) throw new Error(`placeTrailIntent: invalid trail_amount for ${psym}`);
 
-  // Get current mark price to calculate stop price
+  // Get current price to calculate initial stop_price
   const markPrice = nnum(info.row?.mark_price || info.row?.last_price, 0);
   let currentPrice = markPrice;
   if (!(currentPrice > 0)) {
@@ -1266,10 +1266,9 @@ async function placeTrailIntent(m){
   }
   if (!(currentPrice > 0)) throw new Error(`placeTrailIntent: cannot get current price for ${psym}`);
 
-  // Delta India doesn't support trailing_stop_order
-  // Convert trail_amount to a fixed stop_loss_order price:
-  //   LONG position (closeSide=sell): stop = currentPrice - trailAmount
-  //   SHORT position (closeSide=buy): stop = currentPrice + trailAmount
+  // Calculate initial stop_price:
+  //   LONG (closeSide=sell): stop = currentPrice - trailAmount
+  //   SHORT (closeSide=buy): stop = currentPrice + trailAmount
   const isLong = info.closeSide === 'sell';
   const stopPrice = isLong
     ? currentPrice - trailAmount
@@ -1281,6 +1280,10 @@ async function placeTrailIntent(m){
 
   const client_order_id = protectiveClientOrderId('TRL', m.sig_id || m.signal_id, psym);
 
+  // Delta India API: use stop_loss_order + trail_amount + stop_price
+  // trail_amount makes it behave as trailing stop
+  // stop_price is the initial trigger price
+  // stop_trigger_method: last_traded_price for more responsive trailing
   const body = {
     product_symbol: psym,
     order_type: 'market_order',
@@ -1289,10 +1292,12 @@ async function placeTrailIntent(m){
     reduce_only: true,
     stop_order_type: 'stop_loss_order',
     stop_price: String(stopPrice),
+    trail_amount: String(trailAmount),
+    stop_trigger_method: 'last_traded_price',
     client_order_id
   };
 
-  console.log('TRAIL_SL_INTENT placing as stop_loss_order', {
+  console.log('TRAIL_SL_INTENT placing', {
     psym,
     closeSide: info.closeSide,
     lots: info.lots,

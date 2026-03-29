@@ -1446,7 +1446,7 @@ async function processWebhook(msg) {
   const psym   = toProductSymbol(symTV);
 
   const qKey =
-    action === 'CANCEL_PROTECTIVE' || action === 'CLOSE_SL'
+    action === 'CANCEL_PROTECTIVE' || action === 'CLOSE_SL' || action === 'PLACE_SL_INTENT' || action === 'TRAIL_SL_INTENT'
       ? protectiveKey(psym)
       : (isScopeAll(msg) ? 'GLOBAL' : `SYM:${safeUpper(psym)}`);
 

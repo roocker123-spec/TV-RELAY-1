@@ -10,6 +10,13 @@
 //   7) cancels old TP/protective orders before placing fresh TP ladder
 //   8) CLOSE_SL — candle-close confirmed SL (software SL from Pine)
 //
+// ✅ PATCH 2026-03-29: INSTANT WEBHOOK RESPONSE
+//   - All webhook handlers now respond 200 immediately to TradingView
+//   - Processing happens asynchronously AFTER response
+//   - Prevents TradingView "request took too long and timed out" errors
+//   - SL, TPs, and all protection orders now reliably reach the server
+//   - Queue serialization preserved (CANCAL → ENTER → BATCH_TPS → SL in order)
+//
 // STRICT sequencing remains ONLY for:
 //   CANCAL(seq0) -> ENTER(seq1) -> BATCH_TPS(seq2)
 //
@@ -1301,10 +1308,7 @@ async function cancelProtectiveIntent(m){
   return { ok:true, action:'CANCEL_PROTECTIVE', symbol:psym, ...r };
 }
 
-// ===================== NEW: CLOSE_SL (candle-close confirmed SL) ===================== //
-// Pine sends this when candle CLOSES past SL + buffer + volume confirmed.
-// Steps: 1) cancel ALL open orders for symbol (TPs + protective)
-//        2) close position with market order
+// ===================== CLOSE_SL (candle-close confirmed SL) ===================== //
 async function closeSLIntent(m){
   const psym = toProductSymbol(m.symbol || m.product_symbol);
   const sigId = m.sig_id || m.signal_id || '';
@@ -1401,14 +1405,217 @@ app.get('/debug/chain', (_req,res)=>{
   res.json({ size: CHAIN.size, items: out });
 });
 
-// ---------- TradingView webhook ----------
+// =====================================================================
+// ✅ PATCHED: CORE WEBHOOK PROCESSING LOGIC (extracted from /tv handler)
+// This function contains ALL the original processing logic, unchanged.
+// It runs ASYNCHRONOUSLY after TradingView gets its instant 200 response.
+// =====================================================================
+async function processWebhook(msg) {
+  const action = String(msg.action || '').toUpperCase();
+  const sigId  = String(msg.sig_id || msg.signal_id || '');
+  const seq    = (typeof msg.seq !== 'undefined') ? Number(msg.seq) : NaN;
+  const symTV  = msg.symbol || msg.product_symbol || '';
+  const psym   = toProductSymbol(symTV);
+
+  const qKey =
+    action === 'CANCEL_PROTECTIVE' || action === 'CLOSE_SL'
+      ? protectiveKey(psym)
+      : (isScopeAll(msg) ? 'GLOBAL' : `SYM:${safeUpper(psym)}`);
+
+  const out = await enqueue(qKey, async () => {
+
+    const key = seenKey(msg);
+    if (SEEN.has(key)) return { ok:true, dedup:true };
+    rememberSeen(key);
+
+    if (action === 'EXIT') return { ok:true, ignored:'EXIT' };
+
+    // ---------- protection actions (OUTSIDE strict seq0/1/2 chain) ----------
+    if (action === 'PLACE_SL_INTENT') {
+      return await placeSLIntent(msg);
+    }
+    if (action === 'TRAIL_SL_INTENT') {
+      return await placeTrailIntent(msg);
+    }
+    if (action === 'CANCEL_PROTECTIVE') {
+      return await cancelProtectiveIntent(msg);
+    }
+    if (action === 'CLOSE_SL') {
+      return await closeSLIntent(msg);
+    }
+
+    // ---------- strict chain only for entry workflow ----------
+    if (STRICT_SEQUENCE) {
+      if (!sigId) return { ok:true, ignored:'missing_sig_id_in_strict_mode', action, symbol: psym };
+      if (!Number.isFinite(seq)) return { ok:true, ignored:'missing_or_invalid_seq_in_strict_mode', sig_id: sigId, action, symbol: psym };
+      if (![0,1,2].includes(seq)) return { ok:true, ignored:'bad_seq', sig_id: sigId, symbol: psym, seq };
+    }
+
+    console.log('instance:', { K_REVISION: process.env.K_REVISION, HOSTNAME: process.env.HOSTNAME });
+
+    const chain = upsertChainMsg(sigId, psym, seq, msg);
+
+    const ageMs = Date.now() - (chain?.createdAt || Date.now());
+    if (ageMs > SIGNAL_CHAIN_WINDOW_MS) {
+      return { ok:true, ignored:'chain_expired', sig_id: sigId, symbol: psym, age_ms: ageMs, window_ms: SIGNAL_CHAIN_WINDOW_MS };
+    }
+
+    const progressed = [];
+
+    // STEP 1: CANCAL (seq0)
+    if (!chain.didCancel) {
+      if (chain.cancelMsg) {
+        const cancelMsg = chain.cancelMsg;
+        if (typeof cancelMsg.cancel_orders_scope === 'undefined') cancelMsg.cancel_orders_scope = 'SYMBOL';
+
+        const steps = await flattenFromCancelMsg(cancelMsg, psym);
+
+        const requireFlat = (typeof cancelMsg.require_flat === 'undefined') ? false : !!cancelMsg.require_flat;
+        let flat = true;
+        if (requireFlat) {
+          flat = isScopeAll(cancelMsg) ? await waitUntilFlat() : await waitUntilFlatSymbol(psym);
+        }
+
+        chain.didCancel = true;
+        if (STRICT_SEQUENCE) setSigState(sigId, psym, { lastSeq: 0 });
+
+        progressed.push({ ok:true, did:'CANCAL', steps, flat, symbol: psym });
+      } else {
+        if (AUTO_CANCEL_ON_ENTER && chain.enterMsg) {
+          const syntheticCancel = { ...chain.enterMsg, action:'CANCAL', seq:0, cancel_orders_scope:'SYMBOL' };
+          const steps = await flattenFromCancelMsg(syntheticCancel, psym);
+          const flat = isScopeAll(syntheticCancel) ? await waitUntilFlat() : await waitUntilFlatSymbol(psym);
+
+          chain.didCancel = true;
+          if (STRICT_SEQUENCE) setSigState(sigId, psym, { lastSeq: 0 });
+          progressed.push({ ok:true, did:'CANCAL', synthetic:true, steps, flat, symbol: psym });
+        } else {
+          if (chain.enterMsg) {
+            chain.didCancel = true;
+            if (STRICT_SEQUENCE) setSigState(sigId, psym, { lastSeq: 0 });
+            progressed.push({ ok:true, did:'CANCAL', skipped:true, note:'No seq0 received; proceeding because ENTER exists', symbol: psym });
+          } else {
+            return {
+              ok:true,
+              queued:'waiting_for_CANCAL',
+              sig_id: sigId,
+              symbol: psym,
+              have:{ cancel:!!chain.cancelMsg, enter:!!chain.enterMsg, batch:!!chain.batchMsg },
+              did:{ cancel:chain.didCancel, enter:chain.didEnter, batch:chain.didBatch }
+            };
+          }
+        }
+      }
+    }
+
+    // STEP 2: ENTER (seq1)
+    if (chain.didCancel && !chain.didEnter) {
+      if (!chain.enterMsg) {
+        return {
+          ok:true,
+          queued:'waiting_for_ENTER',
+          sig_id: sigId,
+          symbol: psym,
+          have:{ cancel:!!chain.cancelMsg, enter:!!chain.enterMsg, batch:!!chain.batchMsg },
+          did:{ cancel:chain.didCancel, enter:chain.didEnter, batch:chain.didBatch }
+        };
+      }
+
+      const enterMsg = chain.enterMsg;
+
+      if (!chain.didEnterPrep) {
+        const pre = await preflightFromEnterMsg(enterMsg, psym);
+        chain.didEnterPrep = true;
+        progressed.push({ ok:true, did:'ENTER_PRE', pre, symbol: psym });
+      }
+
+      const requireFlat = (typeof enterMsg.require_flat === 'undefined') ? true : !!enterMsg.require_flat;
+
+      if (requireFlat) {
+        const flatNow = isScopeAll(enterMsg) ? await isFlatNowGlobal() : await isFlatNowSymbol(psym);
+        if (!flatNow) {
+          if (FAST_ENTER) {
+            const flatQuick = isScopeAll(enterMsg)
+              ? await waitUntilFlat(FAST_ENTER_WAIT_MS, FLAT_POLL_MS)
+              : await waitUntilFlatSymbol(psym, FAST_ENTER_WAIT_MS, FLAT_POLL_MS);
+
+            if (!flatQuick) {
+              const flatRetry = isScopeAll(enterMsg)
+                ? await waitUntilFlat(FAST_ENTER_RETRY_MS, FLAT_POLL_MS)
+                : await waitUntilFlatSymbol(psym, FAST_ENTER_RETRY_MS, FLAT_POLL_MS);
+
+              if (!flatRetry) {
+                return { ok:false, error:'require_flat_timeout', sig_id: sigId, symbol: psym, stage:'ENTER', note:'Not flat after ENTER preflight. Entry blocked.' };
+              }
+            }
+          } else {
+            const flat = isScopeAll(enterMsg) ? await waitUntilFlat() : await waitUntilFlatSymbol(psym);
+            if (!flat) {
+              return { ok:false, error:'require_flat_timeout', sig_id: sigId, symbol: psym, stage:'ENTER', note:'Not flat after ENTER preflight. Entry blocked.' };
+            }
+          }
+        }
+      }
+
+      const r = await placeEntry(enterMsg);
+      chain.didEnter = true;
+      if (STRICT_SEQUENCE) setSigState(sigId, psym, { lastSeq: 1 });
+
+      progressed.push({ ok:true, step:'entry', r, symbol: psym });
+    }
+
+    // STEP 3: BATCH_TPS (seq2)
+    if (chain.didCancel && chain.didEnter && !chain.didBatch) {
+      if (!chain.batchMsg) {
+        return {
+          ok:true,
+          queued:'waiting_for_BATCH_TPS',
+          sig_id: sigId,
+          symbol: psym,
+          have:{ cancel:!!chain.cancelMsg, enter:!!chain.enterMsg, batch:!!chain.batchMsg },
+          did:{ cancel:chain.didCancel, enter:chain.didEnter, batch:chain.didBatch }
+        };
+      }
+
+      const r = await placeBatch(chain.batchMsg);
+      chain.didBatch = true;
+      if (STRICT_SEQUENCE) setSigState(sigId, psym, { lastSeq: 2 });
+
+      progressed.push({ ok:true, step:'batch', r, symbol: psym });
+    }
+
+    const have = { cancel: !!chain.cancelMsg, enter: !!chain.enterMsg, batch: !!chain.batchMsg };
+    const did  = { cancel: !!chain.didCancel, enterPrep: !!chain.didEnterPrep, enter: !!chain.didEnter, batch: !!chain.didBatch };
+
+    return {
+      ok:true,
+      status: (did.cancel && did.enter && did.batch) ? 'done' : 'progressed',
+      sig_id: sigId,
+      symbol: psym,
+      have,
+      did,
+      progressed
+    };
+  });
+
+  return out;
+}
+
+// =====================================================================
+// ✅ PATCHED: TradingView webhook endpoint
+// NOW: responds INSTANTLY with 200, processes ASYNC in background.
+// TradingView will NEVER see a timeout — even if Delta API takes 10s+.
+// Queue serialization is preserved (CANCAL → ENTER → TPs → SL in order).
+// =====================================================================
 app.post('/tv', async (req, res) => {
   try {
+    // ---- Auth check (fast, synchronous) ----
     if (WEBHOOK_TOKEN) {
       const hdr = req.headers['x-webhook-token'];
       if (hdr !== WEBHOOK_TOKEN) return res.status(401).json({ ok:false, error:'unauthorized' });
     }
 
+    // ---- Parse message (fast, synchronous) ----
     const msg    = (typeof req.body === 'string') ? JSON.parse(req.body) : (req.body || {});
     const action = String(msg.action || '').toUpperCase();
     const sigId  = String(msg.sig_id || msg.signal_id || '');
@@ -1419,196 +1626,43 @@ app.post('/tv', async (req, res) => {
     console.log('\n=== INCOMING /tv ===');
     console.log(JSON.stringify({ action, sigId, seq, symTV, psym, ts: new Date().toISOString() }));
 
-    const qKey =
-      action === 'CANCEL_PROTECTIVE' || action === 'CLOSE_SL'
-        ? protectiveKey(psym)
-        : (isScopeAll(msg) ? 'GLOBAL' : `SYM:${safeUpper(psym)}`);
-
-    const out = await enqueue(qKey, async () => {
-
-      const key = seenKey(msg);
-      if (SEEN.has(key)) return { ok:true, dedup:true };
-      rememberSeen(key);
-
-      if (action === 'EXIT') return { ok:true, ignored:'EXIT' };
-
-      // ---------- protection actions (OUTSIDE strict seq0/1/2 chain) ----------
-      if (action === 'PLACE_SL_INTENT') {
-        return await placeSLIntent(msg);
-      }
-      if (action === 'TRAIL_SL_INTENT') {
-        return await placeTrailIntent(msg);
-      }
-      if (action === 'CANCEL_PROTECTIVE') {
-        return await cancelProtectiveIntent(msg);
-      }
-      // ✅ NEW: CLOSE_SL — candle-close confirmed SL from Pine Script
-      if (action === 'CLOSE_SL') {
-        return await closeSLIntent(msg);
-      }
-
-      // ---------- strict chain only for entry workflow ----------
-      if (STRICT_SEQUENCE) {
-        if (!sigId) return { ok:true, ignored:'missing_sig_id_in_strict_mode', action, symbol: psym };
-        if (!Number.isFinite(seq)) return { ok:true, ignored:'missing_or_invalid_seq_in_strict_mode', sig_id: sigId, action, symbol: psym };
-        if (![0,1,2].includes(seq)) return { ok:true, ignored:'bad_seq', sig_id: sigId, symbol: psym, seq };
-      }
-
-      console.log('instance:', { K_REVISION: process.env.K_REVISION, HOSTNAME: process.env.HOSTNAME });
-
-      const chain = upsertChainMsg(sigId, psym, seq, msg);
-
-      const ageMs = Date.now() - (chain?.createdAt || Date.now());
-      if (ageMs > SIGNAL_CHAIN_WINDOW_MS) {
-        return { ok:true, ignored:'chain_expired', sig_id: sigId, symbol: psym, age_ms: ageMs, window_ms: SIGNAL_CHAIN_WINDOW_MS };
-      }
-
-      const progressed = [];
-
-      // STEP 1: CANCAL (seq0)
-      if (!chain.didCancel) {
-        if (chain.cancelMsg) {
-          const cancelMsg = chain.cancelMsg;
-          if (typeof cancelMsg.cancel_orders_scope === 'undefined') cancelMsg.cancel_orders_scope = 'SYMBOL';
-
-          const steps = await flattenFromCancelMsg(cancelMsg, psym);
-
-          const requireFlat = (typeof cancelMsg.require_flat === 'undefined') ? false : !!cancelMsg.require_flat;
-          let flat = true;
-          if (requireFlat) {
-            flat = isScopeAll(cancelMsg) ? await waitUntilFlat() : await waitUntilFlatSymbol(psym);
-          }
-
-          chain.didCancel = true;
-          if (STRICT_SEQUENCE) setSigState(sigId, psym, { lastSeq: 0 });
-
-          progressed.push({ ok:true, did:'CANCAL', steps, flat, symbol: psym });
-        } else {
-          if (AUTO_CANCEL_ON_ENTER && chain.enterMsg) {
-            const syntheticCancel = { ...chain.enterMsg, action:'CANCAL', seq:0, cancel_orders_scope:'SYMBOL' };
-            const steps = await flattenFromCancelMsg(syntheticCancel, psym);
-            const flat = isScopeAll(syntheticCancel) ? await waitUntilFlat() : await waitUntilFlatSymbol(psym);
-
-            chain.didCancel = true;
-            if (STRICT_SEQUENCE) setSigState(sigId, psym, { lastSeq: 0 });
-            progressed.push({ ok:true, did:'CANCAL', synthetic:true, steps, flat, symbol: psym });
-          } else {
-            if (chain.enterMsg) {
-              chain.didCancel = true;
-              if (STRICT_SEQUENCE) setSigState(sigId, psym, { lastSeq: 0 });
-              progressed.push({ ok:true, did:'CANCAL', skipped:true, note:'No seq0 received; proceeding because ENTER exists', symbol: psym });
-            } else {
-              return {
-                ok:true,
-                queued:'waiting_for_CANCAL',
-                sig_id: sigId,
-                symbol: psym,
-                have:{ cancel:!!chain.cancelMsg, enter:!!chain.enterMsg, batch:!!chain.batchMsg },
-                did:{ cancel:chain.didCancel, enter:chain.didEnter, batch:chain.didBatch }
-              };
-            }
-          }
-        }
-      }
-
-      // STEP 2: ENTER (seq1)
-      if (chain.didCancel && !chain.didEnter) {
-        if (!chain.enterMsg) {
-          return {
-            ok:true,
-            queued:'waiting_for_ENTER',
-            sig_id: sigId,
-            symbol: psym,
-            have:{ cancel:!!chain.cancelMsg, enter:!!chain.enterMsg, batch:!!chain.batchMsg },
-            did:{ cancel:chain.didCancel, enter:chain.didEnter, batch:chain.didBatch }
-          };
-        }
-
-        const enterMsg = chain.enterMsg;
-
-        if (!chain.didEnterPrep) {
-          const pre = await preflightFromEnterMsg(enterMsg, psym);
-          chain.didEnterPrep = true;
-          progressed.push({ ok:true, did:'ENTER_PRE', pre, symbol: psym });
-        }
-
-        const requireFlat = (typeof enterMsg.require_flat === 'undefined') ? true : !!enterMsg.require_flat;
-
-        if (requireFlat) {
-          const flatNow = isScopeAll(enterMsg) ? await isFlatNowGlobal() : await isFlatNowSymbol(psym);
-          if (!flatNow) {
-            if (FAST_ENTER) {
-              const flatQuick = isScopeAll(enterMsg)
-                ? await waitUntilFlat(FAST_ENTER_WAIT_MS, FLAT_POLL_MS)
-                : await waitUntilFlatSymbol(psym, FAST_ENTER_WAIT_MS, FLAT_POLL_MS);
-
-              if (!flatQuick) {
-                const flatRetry = isScopeAll(enterMsg)
-                  ? await waitUntilFlat(FAST_ENTER_RETRY_MS, FLAT_POLL_MS)
-                  : await waitUntilFlatSymbol(psym, FAST_ENTER_RETRY_MS, FLAT_POLL_MS);
-
-                if (!flatRetry) {
-                  return { ok:false, error:'require_flat_timeout', sig_id: sigId, symbol: psym, stage:'ENTER', note:'Not flat after ENTER preflight. Entry blocked.' };
-                }
-              }
-            } else {
-              const flat = isScopeAll(enterMsg) ? await waitUntilFlat() : await waitUntilFlatSymbol(psym);
-              if (!flat) {
-                return { ok:false, error:'require_flat_timeout', sig_id: sigId, symbol: psym, stage:'ENTER', note:'Not flat after ENTER preflight. Entry blocked.' };
-              }
-            }
-          }
-        }
-
-        const r = await placeEntry(enterMsg);
-        chain.didEnter = true;
-        if (STRICT_SEQUENCE) setSigState(sigId, psym, { lastSeq: 1 });
-
-        progressed.push({ ok:true, step:'entry', r, symbol: psym });
-      }
-
-      // STEP 3: BATCH_TPS (seq2)
-      if (chain.didCancel && chain.didEnter && !chain.didBatch) {
-        if (!chain.batchMsg) {
-          return {
-            ok:true,
-            queued:'waiting_for_BATCH_TPS',
-            sig_id: sigId,
-            symbol: psym,
-            have:{ cancel:!!chain.cancelMsg, enter:!!chain.enterMsg, batch:!!chain.batchMsg },
-            did:{ cancel:chain.didCancel, enter:chain.didEnter, batch:chain.didBatch }
-          };
-        }
-
-        const r = await placeBatch(chain.batchMsg);
-        chain.didBatch = true;
-        if (STRICT_SEQUENCE) setSigState(sigId, psym, { lastSeq: 2 });
-
-        progressed.push({ ok:true, step:'batch', r, symbol: psym });
-      }
-
-      const have = { cancel: !!chain.cancelMsg, enter: !!chain.enterMsg, batch: !!chain.batchMsg };
-      const did  = { cancel: !!chain.didCancel, enterPrep: !!chain.didEnterPrep, enter: !!chain.didEnter, batch: !!chain.didBatch };
-
-      return {
-        ok:true,
-        status: (did.cancel && did.enter && did.batch) ? 'done' : 'progressed',
-        sig_id: sigId,
-        symbol: psym,
-        have,
-        did,
-        progressed
-      };
+    // =========================================================
+    // ✅ RESPOND TO TRADINGVIEW IMMEDIATELY — prevents timeout
+    // =========================================================
+    res.status(200).json({
+      ok: true,
+      status: 'accepted',
+      action,
+      symbol: psym,
+      sig_id: sigId,
+      seq: Number.isFinite(seq) ? seq : undefined,
+      ts: new Date().toISOString()
     });
 
-    return res.json(out);
+    // =========================================================
+    // ✅ PROCESS ASYNCHRONOUSLY — runs AFTER response is sent
+    // The enqueue() inside processWebhook() preserves ordering:
+    //   CANCAL → ENTER → BATCH_TPS all serialize on same queue key
+    //   PLACE_SL_INTENT serializes on its own protective queue key
+    // =========================================================
+    setImmediate(async () => {
+      try {
+        const result = await processWebhook(msg);
+        console.log(`ASYNC RESULT [${action}] ${psym}:`, JSON.stringify(result));
+      } catch (e) {
+        console.error(`✖ ASYNC ERROR [${action}] ${psym}:`, e?.message || e);
+      }
+    });
 
   } catch (e) {
-    console.error('✖ ERROR:', e?.message || e);
-    return res.status(400).json({ ok:false, error:String(e.message || e) });
+    console.error('✖ PARSE/AUTH ERROR:', e?.message || e);
+    // If we haven't sent a response yet (parse/auth failed before res.json)
+    if (!res.headersSent) {
+      return res.status(400).json({ ok:false, error:String(e.message || e) });
+    }
   }
 });
 
 app.listen(PORT, ()=>console.log(
-  `Relay listening http://localhost:${PORT} (BASE=${BASE_URL}, AUTH=${AUTH_MODE}, STRICT_SEQUENCE=${STRICT_SEQUENCE}, FAST_ENTER=${FAST_ENTER}, SIGNAL_CHAIN_WINDOW_MS=${SIGNAL_CHAIN_WINDOW_MS}, AUTO_CANCEL_ON_ENTER=${AUTO_CANCEL_ON_ENTER}, FORCE_CLOSE_ON_CANCEL=${FORCE_CLOSE_ON_CANCEL})`
+  `Relay listening http://localhost:${PORT} (BASE=${BASE_URL}, AUTH=${AUTH_MODE}, STRICT_SEQUENCE=${STRICT_SEQUENCE}, FAST_ENTER=${FAST_ENTER}, SIGNAL_CHAIN_WINDOW_MS=${SIGNAL_CHAIN_WINDOW_MS}, AUTO_CANCEL_ON_ENTER=${AUTO_CANCEL_ON_ENTER}, FORCE_CLOSE_ON_CANCEL=${FORCE_CLOSE_ON_CANCEL}, INSTANT_RESPONSE=true)`
 ));

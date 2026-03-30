@@ -988,7 +988,7 @@ async function cancelOrdersBySymbol(psym, { fallbackAll=false, skipProtective=fa
   return { ok:true, cancelled, failed, symbol: sym };
 }
 
-async function cancelProtectiveOrdersBySymbol(psym){
+async function cancelProtectiveOrdersBySymbol(psym, skipClientOrderId = null){
   const sym = toProductSymbol(psym);
   if (!sym) return { ok:true, skipped:true, reason:'missing_symbol' };
 
@@ -1001,7 +1001,9 @@ async function cancelProtectiveOrdersBySymbol(psym){
 
   const mine = open.filter(o =>
     safeUpper(o?.product_symbol || o?.symbol) === safeUpper(sym) &&
-    isProtectiveOrder(o)
+    isProtectiveOrder(o) &&
+    // ✅ FIX 4: Skip the order we JUST placed (don't cancel our own new protection)
+    (!skipClientOrderId || String(o?.client_order_id || '') !== String(skipClientOrderId))
   );
 
   if (!mine.length) {
@@ -1319,8 +1321,6 @@ async function placeSLIntent(m){
   const stopPrice = nnum(m.stop_price, 0);
   if (!(stopPrice > 0)) throw new Error(`placeSLIntent: invalid stop_price for ${psym}`);
 
-  await cancelProtectiveOrdersBySymbol(psym);
-
   const client_order_id = protectiveClientOrderId('SL', sigId, psym);
 
   const body = {
@@ -1334,7 +1334,7 @@ async function placeSLIntent(m){
     client_order_id
   };
 
-  console.log('PLACE_SL_INTENT placing', {
+  console.log('PLACE_SL_INTENT placing (place-first, cancel-after)', {
     psym,
     closeSide: info.closeSide,
     lots: info.lots,
@@ -1342,7 +1342,17 @@ async function placeSLIntent(m){
     client_order_id
   });
 
+  // ✅ FIX 4: PLACE NEW SL FIRST, then cancel old protective orders.
+  //   If placement fails, old SL stays in place → position never left naked.
   const r = await dcall('POST', '/v2/orders', body);
+
+  // New SL placed successfully → now safe to cancel old protective orders
+  try {
+    await cancelProtectiveOrdersBySymbol(psym, client_order_id);
+  } catch (e) {
+    console.warn('placeSLIntent: cancel old protective failed (non-fatal, new SL is already placed)', { psym, err: e?.message || e });
+  }
+
   return { ok:true, action:'PLACE_SL_INTENT', symbol:psym, lots:info.lots, closeSide:info.closeSide, stopPrice, r };
 }
 
@@ -1397,13 +1407,15 @@ async function placeTrailIntent(m){
 
   if (!(stopPrice > 0)) throw new Error(`placeTrailIntent: calculated stopPrice=${stopPrice} invalid for ${psym}`);
 
-  await cancelProtectiveOrdersBySymbol(psym);
-
   const client_order_id = protectiveClientOrderId('TRL', sigId, psym);
 
-  // Delta India API: use stop_loss_order + trail_amount + stop_price
+  // ✅ FIX 4b: Delta India API requires NEGATIVE trail_amount for sell stop orders (closing a long),
+  //   and POSITIVE trail_amount for buy stop orders (closing a short).
+  //   Without this, sell-side trails get: "Trail amount should be negative for sell stop orders"
+  const signedTrailAmount = isLong ? -trailAmount : trailAmount;
+
+  // Delta India API: use stop_loss_order + trail_amount
   // trail_amount makes it behave as trailing stop
-  // stop_price is the initial trigger price
   // stop_trigger_method: last_traded_price for more responsive trailing
   const body = {
     product_symbol: psym,
@@ -1412,24 +1424,35 @@ async function placeTrailIntent(m){
     size: info.lots,
     reduce_only: true,
     stop_order_type: 'stop_loss_order',
-    trail_amount: String(info.closeSide === 'sell' ? -trailAmount : trailAmount),
+    trail_amount: String(signedTrailAmount),
     stop_trigger_method: 'last_traded_price',
     client_order_id
   };
 
-  console.log('TRAIL_SL_INTENT placing', {
+  console.log('TRAIL_SL_INTENT placing (place-first, cancel-after)', {
     psym,
     closeSide: info.closeSide,
     lots: info.lots,
     isLong,
     currentPrice,
     trailAmount,
+    signedTrailAmount,
     stopPrice,
     mode: m.trail_mode || 'ACTIVATE',
     client_order_id
   });
 
+  // ✅ FIX 4: PLACE NEW TRAIL FIRST, then cancel old protective orders.
+  //   If trail placement fails, old SL stays in place → position never left naked.
   const r = await dcall('POST', '/v2/orders', body);
+
+  // New trail placed successfully → now safe to cancel old protective orders
+  try {
+    await cancelProtectiveOrdersBySymbol(psym, client_order_id);
+  } catch (e) {
+    console.warn('placeTrailIntent: cancel old protective failed (non-fatal, new trail is already placed)', { psym, err: e?.message || e });
+  }
+
   return {
     ok:true,
     action:'TRAIL_SL_INTENT',
@@ -1437,6 +1460,7 @@ async function placeTrailIntent(m){
     lots:info.lots,
     closeSide:info.closeSide,
     trailAmount,
+    signedTrailAmount,
     stopPrice,
     currentPrice,
     mode:m.trail_mode || 'ACTIVATE',

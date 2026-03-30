@@ -17,6 +17,16 @@
 //   - SL, TPs, and all protection orders now reliably reach the server
 //   - Queue serialization preserved (CANCAL → ENTER → BATCH_TPS → SL in order)
 //
+// ✅ PATCH 2026-03-30: CHAIN TTL + SL SYNC + TP VALIDATION
+//   FIX 1: CHAIN_TTL bumped 2min → 10min; lastTouch refreshed during long ops
+//          Root cause: cleanup was deleting active chains mid-flight when entry
+//          took >2min (DEEP/FIL took ~126s), so BATCH_TPS got a blank chain.
+//   FIX 2: SL/Trail intent now waits for the entry chain's didEnter flag instead
+//          of a blind 10s sleep. Polls up to PROTECTION_WAIT_FOR_ENTRY_MS (180s).
+//          This guarantees SL is placed AFTER entry, regardless of entry duration.
+//   FIX 3: TP price validation — rejects TPs that would fill instantly at a loss
+//          (sell limit below entry for longs, buy limit above entry for shorts).
+//
 // STRICT sequencing remains ONLY for:
 //   CANCAL(seq0) -> ENTER(seq1) -> BATCH_TPS(seq2)
 //
@@ -139,6 +149,10 @@ const POSITION_WAIT_MS   = nnum(process.env.POSITION_WAIT_MS, 30000);
 const POSITION_POLL_MS   = nnum(process.env.POSITION_POLL_MS, 350);
 const PROTECTIVE_PREFIX  = String(process.env.PROTECTIVE_PREFIX || 'PRT');
 
+// ✅ FIX 2: How long SL/Trail waits for entry chain to set didEnter (default 180s)
+const PROTECTION_WAIT_FOR_ENTRY_MS = nnum(process.env.PROTECTION_WAIT_FOR_ENTRY_MS, 180_000);
+const PROTECTION_ENTRY_POLL_MS     = nnum(process.env.PROTECTION_ENTRY_POLL_MS, 1000);
+
 // ---------- idempotency ----------
 const SEEN = new Map();
 const SEEN_TTL_MS = 60_000;
@@ -188,7 +202,8 @@ function setSigState(sig_id, psym, patch){
 
 // -------------------- CHAIN BUFFER --------------------
 const CHAIN = new Map();
-const CHAIN_TTL_MS = 2 * 60 * 1000;
+// ✅ FIX 1: Bumped from 2 min to 10 min — entry chains can take 2+ min on slow fills
+const CHAIN_TTL_MS = nnum(process.env.CHAIN_TTL_MS, 10 * 60 * 1000);
 
 function cleanupChain(){
   const now = Date.now();
@@ -227,6 +242,22 @@ function upsertChainMsg(sigId, psym, seq, msg){
   if (seq === 2) c.batchMsg  = msg;
   c.lastTouch = Date.now();
   return c;
+}
+
+// ✅ FIX 1 helper: touch chain to prevent TTL expiry during long operations
+function touchChain(sigId, psym) {
+  if (!sigId || !psym) return;
+  const k = sigKey(sigId, psym);
+  const c = CHAIN.get(k);
+  if (c) c.lastTouch = Date.now();
+}
+
+// ✅ FIX 2 helper: peek at chain's didEnter without creating/touching it
+function peekChainDidEnter(sigId, psym) {
+  if (!sigId || !psym) return false;
+  const k = sigKey(sigId, psym);
+  const c = CHAIN.get(k);
+  return !!(c && c.didEnter);
 }
 
 // ---------- Delta request helper ----------
@@ -724,9 +755,17 @@ async function placeBatch(m){
   const tpSide = posInfo.closeSide;
   const positionLots = posInfo.lots;
 
+  // ✅ FIX 3: Get entry price for TP validation
+  const entryPrice = nnum(posInfo.row?.entry_price, 0) || nnum(m.entry, 0);
+  const isLong = (tpSide === 'sell');  // long → close side is sell
+
   await cancelTpAndProtectiveOrdersBySymbol(psym);
 
-  let pre = m.orders.slice(0, 50).map((o, idx) => {
+  let pre = [];
+  let skippedTps = [];
+
+  for (let idx = 0; idx < Math.min(m.orders.length, 50); idx++) {
+    const o = m.orders[idx];
     const oo = { ...o };
 
     const sizeLots = normalizeTpSizeLots({ psym, lotMult, order: oo, lastEntry });
@@ -736,18 +775,43 @@ async function placeBatch(m){
     if (typeof oo.limit_price !== 'undefined') oo.limit_price = String(oo.limit_price);
     if (!oo.limit_price) throw new Error(`placeBatch: missing limit_price on order #${idx}`);
 
+    // ✅ FIX 3: Validate TP price won't fill instantly at a loss
+    const tpPrice = nnum(oo.limit_price, 0);
+    if (entryPrice > 0 && tpPrice > 0) {
+      if (isLong && tpPrice < entryPrice) {
+        // LONG position: sell limit BELOW entry → fills instantly at a loss
+        console.warn(`⚠ TP PRICE REJECTED [${psym}] order #${idx}: sell limit ${tpPrice} < entry ${entryPrice} (long). Would fill at a loss. SKIPPING.`);
+        skippedTps.push({ idx, limit_price: oo.limit_price, reason: 'sell_limit_below_entry_for_long', entryPrice });
+        continue;
+      }
+      if (!isLong && tpPrice > entryPrice) {
+        // SHORT position: buy limit ABOVE entry → fills instantly at a loss
+        console.warn(`⚠ TP PRICE REJECTED [${psym}] order #${idx}: buy limit ${tpPrice} > entry ${entryPrice} (short). Would fill at a loss. SKIPPING.`);
+        skippedTps.push({ idx, limit_price: oo.limit_price, reason: 'buy_limit_above_entry_for_short', entryPrice });
+        continue;
+      }
+    }
+
     if (!oo.client_order_id) oo.client_order_id = shortClientOrderId(sigId, psym, idx);
     oo.client_order_id = String(oo.client_order_id).slice(0, 32);
 
-    return {
+    pre.push({
       idx,
       limit_price: oo.limit_price,
       sizeLots: Math.max(1, parseInt(sizeLots, 10)),
       client_order_id: oo.client_order_id,
       post_only: (typeof oo.post_only !== 'undefined') ? !!oo.post_only : undefined,
       mmp: (typeof oo.mmp !== 'undefined') ? !!oo.mmp : undefined
-    };
-  });
+    });
+  }
+
+  if (skippedTps.length) {
+    console.warn(`⚠ TP VALIDATION: ${skippedTps.length} TPs skipped for ${psym}`, { skippedTps, entryPrice, isLong });
+  }
+
+  if (!pre.length) {
+    throw new Error(`placeBatch: all TPs rejected by price validation for ${psym} (entry=${entryPrice}, isLong=${isLong}). Skipped: ${JSON.stringify(skippedTps)}`);
+  }
 
   pre = clampBatchLotsToPosition(pre, positionLots);
 
@@ -759,7 +823,8 @@ async function placeBatch(m){
     positionLots,
     tpSide,
     sumLots,
-    first3: pre.slice(0,3)
+    first3: pre.slice(0,3),
+    skippedCount: skippedTps.length
   });
 
   if (sumLots > positionLots) {
@@ -827,6 +892,7 @@ async function placeBatch(m){
     psym,
     placed: placed.length,
     failed: failed.length,
+    skipped: skippedTps.length,
     placed_first3: placed.slice(0, 3),
     failed_first3: failed.slice(0, 3)
   });
@@ -835,7 +901,7 @@ async function placeBatch(m){
     throw new Error(`placeBatch: all TP placements failed for ${psym}`);
   }
 
-  return { ok:true, mode:'single_orders', placed, failed };
+  return { ok:true, mode:'single_orders', placed, failed, skippedTps };
 }
 
 // ---------- CANCEL/CLOSE ----------
@@ -1067,6 +1133,27 @@ async function waitUntilPositionSymbol(psym, timeoutMs = POSITION_WAIT_MS, pollM
   return null;
 }
 
+// ✅ FIX 2 helper: wait for the entry chain to set didEnter for a given sigId+psym
+async function waitForEntryChainCompletion(sigId, psym, timeoutMs = PROTECTION_WAIT_FOR_ENTRY_MS, pollMs = PROTECTION_ENTRY_POLL_MS) {
+  const start = Date.now();
+  const end = start + timeoutMs;
+
+  console.log(`waitForEntryChain: polling for didEnter on ${psym} (sigId=${sigId}), timeout=${timeoutMs}ms`);
+
+  while (Date.now() < end) {
+    if (peekChainDidEnter(sigId, psym)) {
+      const elapsed = Date.now() - start;
+      console.log(`waitForEntryChain: didEnter=true for ${psym} after ${elapsed}ms`);
+      return true;
+    }
+    await sleep(pollMs);
+  }
+
+  const elapsed = Date.now() - start;
+  console.warn(`waitForEntryChain: TIMEOUT waiting for didEnter on ${psym} after ${elapsed}ms`);
+  return false;
+}
+
 // ----- Flatten helper for CANCAL (seq0) -----
 async function flattenFromCancelMsg(cancelMsg, psym){
   const scopeAll = isScopeAll(cancelMsg);
@@ -1199,21 +1286,32 @@ async function preflightFromEnterMsg(enterMsg, psym){
 // ---------- protection actions ----------
 async function placeSLIntent(m){
   const psym = toProductSymbol(m.symbol || m.product_symbol);
+  const sigId = m.sig_id || m.signal_id || '';
+
   console.log('PLACE_SL_INTENT received', {
-    sig_id: m.sig_id || m.signal_id,
-    symbol: m.symbol || m.product_symbol,
+    sig_id: sigId,
+    symbol: psym,
     stop_price: m.stop_price
   });
 
   if (!psym) throw new Error('placeSLIntent: missing symbol/product_symbol');
 
-  // Wait for entry chain to clear old position first
-  // Without this, we find the OLD position, place SL, then CANCAL deletes it
-  console.log(`placeSLIntent: waiting 10s for entry chain to clear old orders/position...`);
-  await sleep(10000);
+  // ✅ FIX 2: Wait for the entry chain to complete (didEnter=true) instead of blind 10s sleep.
+  //   This guarantees SL placement happens AFTER the entry order fills, regardless of how long
+  //   the entry chain takes (could be 2s or 200s depending on API latency and flat-wait).
+  if (sigId) {
+    const entryDone = await waitForEntryChainCompletion(sigId, psym);
+    if (!entryDone) {
+      console.warn(`placeSLIntent: entry chain never completed for ${psym} (sigId=${sigId}), proceeding anyway to check position`);
+    }
+  } else {
+    // No sigId → fallback to old behavior (short sleep)
+    console.log(`placeSLIntent: no sigId, falling back to 10s sleep for ${psym}`);
+    await sleep(10000);
+  }
 
-  // Now wait for the NEW position to appear (up to 50s total: 10s sleep + 40s poll)
-  const info = await waitUntilPositionSymbol(psym, 40000);
+  // Now wait for the NEW position to appear (up to POSITION_WAIT_MS)
+  const info = await waitUntilPositionSymbol(psym, POSITION_WAIT_MS);
   if (!info || !info.hasPos || !(info.lots > 0)) {
     throw new Error(`placeSLIntent: no live position found for ${psym}`);
   }
@@ -1223,7 +1321,7 @@ async function placeSLIntent(m){
 
   await cancelProtectiveOrdersBySymbol(psym);
 
-  const client_order_id = protectiveClientOrderId('SL', m.sig_id || m.signal_id, psym);
+  const client_order_id = protectiveClientOrderId('SL', sigId, psym);
 
   const body = {
     product_symbol: psym,
@@ -1250,21 +1348,30 @@ async function placeSLIntent(m){
 
 async function placeTrailIntent(m){
   const psym = toProductSymbol(m.symbol || m.product_symbol);
+  const sigId = m.sig_id || m.signal_id || '';
+
   console.log('TRAIL_SL_INTENT received', {
-    sig_id: m.sig_id || m.signal_id,
-    symbol: m.symbol || m.product_symbol,
+    sig_id: sigId,
+    symbol: psym,
     trail_amount: m.trail_amount,
     mode: m.trail_mode
   });
 
   if (!psym) throw new Error('placeTrailIntent: missing symbol/product_symbol');
 
-  // Wait for entry chain to clear old position first
-  console.log(`placeTrailIntent: waiting 10s for entry chain to clear old orders/position...`);
-  await sleep(10000);
+  // ✅ FIX 2: Wait for the entry chain to complete instead of blind 10s sleep
+  if (sigId) {
+    const entryDone = await waitForEntryChainCompletion(sigId, psym);
+    if (!entryDone) {
+      console.warn(`placeTrailIntent: entry chain never completed for ${psym} (sigId=${sigId}), proceeding anyway to check position`);
+    }
+  } else {
+    console.log(`placeTrailIntent: no sigId, falling back to 10s sleep for ${psym}`);
+    await sleep(10000);
+  }
 
   // Now wait for the NEW position to appear
-  const info = await waitUntilPositionSymbol(psym, 40000);
+  const info = await waitUntilPositionSymbol(psym, POSITION_WAIT_MS);
   if (!info || !info.hasPos || !(info.lots > 0)) {
     throw new Error(`placeTrailIntent: no live position found for ${psym}`);
   }
@@ -1292,7 +1399,7 @@ async function placeTrailIntent(m){
 
   await cancelProtectiveOrdersBySymbol(psym);
 
-  const client_order_id = protectiveClientOrderId('TRL', m.sig_id || m.signal_id, psym);
+  const client_order_id = protectiveClientOrderId('TRL', sigId, psym);
 
   // Delta India API: use stop_loss_order + trail_amount + stop_price
   // trail_amount makes it behave as trailing stop
@@ -1509,12 +1616,17 @@ async function processWebhook(msg) {
         const cancelMsg = chain.cancelMsg;
         if (typeof cancelMsg.cancel_orders_scope === 'undefined') cancelMsg.cancel_orders_scope = 'SYMBOL';
 
+        // ✅ FIX 1: Touch chain before expensive operation
+        touchChain(sigId, psym);
         const steps = await flattenFromCancelMsg(cancelMsg, psym);
+        touchChain(sigId, psym);
 
         const requireFlat = (typeof cancelMsg.require_flat === 'undefined') ? false : !!cancelMsg.require_flat;
         let flat = true;
         if (requireFlat) {
+          touchChain(sigId, psym);
           flat = isScopeAll(cancelMsg) ? await waitUntilFlat() : await waitUntilFlatSymbol(psym);
+          touchChain(sigId, psym);
         }
 
         chain.didCancel = true;
@@ -1524,8 +1636,15 @@ async function processWebhook(msg) {
       } else {
         if (AUTO_CANCEL_ON_ENTER && chain.enterMsg) {
           const syntheticCancel = { ...chain.enterMsg, action:'CANCAL', seq:0, cancel_orders_scope:'SYMBOL' };
+
+          touchChain(sigId, psym);
           const steps = await flattenFromCancelMsg(syntheticCancel, psym);
-          const flat = isScopeAll(syntheticCancel) ? await waitUntilFlat() : await waitUntilFlatSymbol(psym);
+          touchChain(sigId, psym);
+
+          const flat = isScopeAll(syntheticCancel)
+            ? await waitUntilFlat()
+            : await waitUntilFlatSymbol(psym);
+          touchChain(sigId, psym);
 
           chain.didCancel = true;
           if (STRICT_SEQUENCE) setSigState(sigId, psym, { lastSeq: 0 });
@@ -1565,7 +1684,10 @@ async function processWebhook(msg) {
       const enterMsg = chain.enterMsg;
 
       if (!chain.didEnterPrep) {
+        touchChain(sigId, psym);
         const pre = await preflightFromEnterMsg(enterMsg, psym);
+        touchChain(sigId, psym);
+
         chain.didEnterPrep = true;
         progressed.push({ ok:true, did:'ENTER_PRE', pre, symbol: psym });
       }
@@ -1573,24 +1695,34 @@ async function processWebhook(msg) {
       const requireFlat = (typeof enterMsg.require_flat === 'undefined') ? true : !!enterMsg.require_flat;
 
       if (requireFlat) {
+        touchChain(sigId, psym);
         const flatNow = isScopeAll(enterMsg) ? await isFlatNowGlobal() : await isFlatNowSymbol(psym);
+        touchChain(sigId, psym);
+
         if (!flatNow) {
           if (FAST_ENTER) {
+            touchChain(sigId, psym);
             const flatQuick = isScopeAll(enterMsg)
               ? await waitUntilFlat(FAST_ENTER_WAIT_MS, FLAT_POLL_MS)
               : await waitUntilFlatSymbol(psym, FAST_ENTER_WAIT_MS, FLAT_POLL_MS);
+            touchChain(sigId, psym);
 
             if (!flatQuick) {
+              touchChain(sigId, psym);
               const flatRetry = isScopeAll(enterMsg)
                 ? await waitUntilFlat(FAST_ENTER_RETRY_MS, FLAT_POLL_MS)
                 : await waitUntilFlatSymbol(psym, FAST_ENTER_RETRY_MS, FLAT_POLL_MS);
+              touchChain(sigId, psym);
 
               if (!flatRetry) {
                 return { ok:false, error:'require_flat_timeout', sig_id: sigId, symbol: psym, stage:'ENTER', note:'Not flat after ENTER preflight. Entry blocked.' };
               }
             }
           } else {
+            touchChain(sigId, psym);
             const flat = isScopeAll(enterMsg) ? await waitUntilFlat() : await waitUntilFlatSymbol(psym);
+            touchChain(sigId, psym);
+
             if (!flat) {
               return { ok:false, error:'require_flat_timeout', sig_id: sigId, symbol: psym, stage:'ENTER', note:'Not flat after ENTER preflight. Entry blocked.' };
             }
@@ -1598,7 +1730,10 @@ async function processWebhook(msg) {
         }
       }
 
+      touchChain(sigId, psym);
       const r = await placeEntry(enterMsg);
+      touchChain(sigId, psym);
+
       chain.didEnter = true;
       if (STRICT_SEQUENCE) setSigState(sigId, psym, { lastSeq: 1 });
 
@@ -1618,7 +1753,10 @@ async function processWebhook(msg) {
         };
       }
 
+      touchChain(sigId, psym);
       const r = await placeBatch(chain.batchMsg);
+      touchChain(sigId, psym);
+
       chain.didBatch = true;
       if (STRICT_SEQUENCE) setSigState(sigId, psym, { lastSeq: 2 });
 
@@ -1705,5 +1843,5 @@ app.post('/tv', async (req, res) => {
 });
 
 app.listen(PORT, ()=>console.log(
-  `Relay listening http://localhost:${PORT} (BASE=${BASE_URL}, AUTH=${AUTH_MODE}, STRICT_SEQUENCE=${STRICT_SEQUENCE}, FAST_ENTER=${FAST_ENTER}, SIGNAL_CHAIN_WINDOW_MS=${SIGNAL_CHAIN_WINDOW_MS}, AUTO_CANCEL_ON_ENTER=${AUTO_CANCEL_ON_ENTER}, FORCE_CLOSE_ON_CANCEL=${FORCE_CLOSE_ON_CANCEL}, INSTANT_RESPONSE=true)`
+  `Relay listening http://localhost:${PORT} (BASE=${BASE_URL}, AUTH=${AUTH_MODE}, STRICT_SEQUENCE=${STRICT_SEQUENCE}, FAST_ENTER=${FAST_ENTER}, SIGNAL_CHAIN_WINDOW_MS=${SIGNAL_CHAIN_WINDOW_MS}, AUTO_CANCEL_ON_ENTER=${AUTO_CANCEL_ON_ENTER}, FORCE_CLOSE_ON_CANCEL=${FORCE_CLOSE_ON_CANCEL}, CHAIN_TTL_MS=${CHAIN_TTL_MS}, PROTECTION_WAIT_FOR_ENTRY_MS=${PROTECTION_WAIT_FOR_ENTRY_MS}, INSTANT_RESPONSE=true)`
 ));

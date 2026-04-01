@@ -1589,10 +1589,7 @@ async function processWebhook(msg) {
   const symTV  = msg.symbol || msg.product_symbol || '';
   const psym   = toProductSymbol(symTV);
 
-  const qKey =
-    action === 'CANCEL_PROTECTIVE' || action === 'CLOSE_SL' || action === 'PLACE_SL_INTENT' || action === 'TRAIL_SL_INTENT'
-      ? protectiveKey(psym)
-      : (isScopeAll(msg) ? 'GLOBAL' : `SYM:${safeUpper(psym)}`);
+  const qKey = isScopeAll(msg) ? 'GLOBAL' : `SYM:${safeUpper(psym)}`;
 
   const out = await enqueue(qKey, async () => {
 

@@ -157,8 +157,6 @@ const PROTECTION_ENTRY_POLL_MS     = nnum(process.env.PROTECTION_ENTRY_POLL_MS, 
 const MIN_TP_DISTANCE_PCT = nnum(process.env.MIN_TP_DISTANCE_PCT, 0.15);
 
 // ---------- idempotency ----------
-
-// ---------- idempotency ----------
 const SEEN = new Map();
 const SEEN_TTL_MS = 60_000;
 
@@ -794,11 +792,6 @@ async function placeBatch(m){
       if (isLong && tpPrice < entryPrice) {
         console.warn(`⚠ TP PRICE REJECTED [${psym}] order #${idx}: sell limit ${tpPrice} < entry ${entryPrice} (long). Would fill at a loss. SKIPPING.`);
         skippedTps.push({ idx, limit_price: oo.limit_price, sizeLots, reason: 'sell_limit_below_entry_for_long', entryPrice });
-        continue;
-      }
-      if (!isLong && tpPrice > entryPrice) {
-        console.warn(`⚠ TP PRICE REJECTED [${psym}] order #${idx}: buy limit ${tpPrice} > entry ${entryPrice} (short). Would fill at a loss. SKIPPING.`);
-        skippedTps.push({ idx, limit_price: oo.limit_price, sizeLots, reason: 'buy_limit_above_entry_for_short', entryPrice });
         continue;
       }
       // FIX 6: TP too close to entry = useless (like COOKIE where entry = TP1)

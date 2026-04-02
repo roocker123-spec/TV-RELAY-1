@@ -794,6 +794,11 @@ async function placeBatch(m){
         skippedTps.push({ idx, limit_price: oo.limit_price, sizeLots, reason: 'sell_limit_below_entry_for_long', entryPrice });
         continue;
       }
+      if (!isLong && tpPrice > entryPrice) {
+        console.warn(`⚠ TP PRICE REJECTED [${psym}] order #${idx}: buy limit ${tpPrice} > entry ${entryPrice} (short). Would fill at a loss. SKIPPING.`);
+        skippedTps.push({ idx, limit_price: oo.limit_price, sizeLots, reason: 'buy_limit_above_entry_for_short', entryPrice });
+        continue;
+      }
       // FIX 6: TP too close to entry = useless (like COOKIE where entry = TP1)
       const distPct = Math.abs(tpPrice - entryPrice) / entryPrice * 100;
       if (distPct < MIN_TP_DISTANCE_PCT) {
@@ -802,13 +807,7 @@ async function placeBatch(m){
         continue;
       }
     }
-      if (!isLong && tpPrice > entryPrice) {
-        // SHORT position: buy limit ABOVE entry → fills instantly at a loss
-        console.warn(`⚠ TP PRICE REJECTED [${psym}] order #${idx}: buy limit ${tpPrice} > entry ${entryPrice} (short). Would fill at a loss. SKIPPING.`);
-        skippedTps.push({ idx, limit_price: oo.limit_price, reason: 'buy_limit_above_entry_for_short', entryPrice });
-        continue;
-      }
-    }
+    
 
     if (!oo.client_order_id) oo.client_order_id = shortClientOrderId(sigId, psym, idx);
     oo.client_order_id = String(oo.client_order_id).slice(0, 32);

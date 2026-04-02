@@ -153,6 +153,11 @@ const PROTECTIVE_PREFIX  = String(process.env.PROTECTIVE_PREFIX || 'PRT');
 const PROTECTION_WAIT_FOR_ENTRY_MS = nnum(process.env.PROTECTION_WAIT_FOR_ENTRY_MS, 180_000);
 const PROTECTION_ENTRY_POLL_MS     = nnum(process.env.PROTECTION_ENTRY_POLL_MS, 1000);
 
+// FIX 6: Minimum TP distance from entry (% of entry price)
+const MIN_TP_DISTANCE_PCT = nnum(process.env.MIN_TP_DISTANCE_PCT, 0.15);
+
+// ---------- idempotency ----------
+
 // ---------- idempotency ----------
 const SEEN = new Map();
 const SEEN_TTL_MS = 60_000;
@@ -783,15 +788,27 @@ async function placeBatch(m){
     if (typeof oo.limit_price !== 'undefined') oo.limit_price = String(oo.limit_price);
     if (!oo.limit_price) throw new Error(`placeBatch: missing limit_price on order #${idx}`);
 
-    // ✅ FIX 3: Validate TP price won't fill instantly at a loss
+    // FIX 3 + FIX 6: Validate TP price — reject wrong-side AND too-close TPs
     const tpPrice = nnum(oo.limit_price, 0);
     if (entryPrice > 0 && tpPrice > 0) {
       if (isLong && tpPrice < entryPrice) {
-        // LONG position: sell limit BELOW entry → fills instantly at a loss
         console.warn(`⚠ TP PRICE REJECTED [${psym}] order #${idx}: sell limit ${tpPrice} < entry ${entryPrice} (long). Would fill at a loss. SKIPPING.`);
-        skippedTps.push({ idx, limit_price: oo.limit_price, reason: 'sell_limit_below_entry_for_long', entryPrice });
+        skippedTps.push({ idx, limit_price: oo.limit_price, sizeLots, reason: 'sell_limit_below_entry_for_long', entryPrice });
         continue;
       }
+      if (!isLong && tpPrice > entryPrice) {
+        console.warn(`⚠ TP PRICE REJECTED [${psym}] order #${idx}: buy limit ${tpPrice} > entry ${entryPrice} (short). Would fill at a loss. SKIPPING.`);
+        skippedTps.push({ idx, limit_price: oo.limit_price, sizeLots, reason: 'buy_limit_above_entry_for_short', entryPrice });
+        continue;
+      }
+      // FIX 6: TP too close to entry = useless (like COOKIE where entry = TP1)
+      const distPct = Math.abs(tpPrice - entryPrice) / entryPrice * 100;
+      if (distPct < MIN_TP_DISTANCE_PCT) {
+        console.warn(`⚠ TP TOO CLOSE [${psym}] order #${idx}: ${tpSide} limit ${tpPrice} is only ${distPct.toFixed(3)}% from entry ${entryPrice} (min ${MIN_TP_DISTANCE_PCT}%). SKIPPING.`);
+        skippedTps.push({ idx, limit_price: oo.limit_price, sizeLots, reason: 'tp_too_close_to_entry', distPct: +distPct.toFixed(4), minPct: MIN_TP_DISTANCE_PCT, entryPrice });
+        continue;
+      }
+    }
       if (!isLong && tpPrice > entryPrice) {
         // SHORT position: buy limit ABOVE entry → fills instantly at a loss
         console.warn(`⚠ TP PRICE REJECTED [${psym}] order #${idx}: buy limit ${tpPrice} > entry ${entryPrice} (short). Would fill at a loss. SKIPPING.`);
@@ -815,6 +832,17 @@ async function placeBatch(m){
 
   if (skippedTps.length) {
     console.warn(`⚠ TP VALIDATION: ${skippedTps.length} TPs skipped for ${psym}`, { skippedTps, entryPrice, isLong });
+
+    // FIX 6: Redistribute skipped TP lots to last remaining TP (furthest from entry)
+    const skippedLots = skippedTps.reduce((a, s) => a + (s.sizeLots || 0), 0);
+    if (skippedLots > 0 && pre.length > 0) {
+      const lastIdx = pre.length - 1;
+      pre[lastIdx].sizeLots += skippedLots;
+      console.log(`⚠ TP REDISTRIBUTION [${psym}]: ${skippedLots} lots from ${skippedTps.length} skipped TPs → added to TP#${pre[lastIdx].idx} (${pre[lastIdx].limit_price})`, {
+        newSize: pre[lastIdx].sizeLots,
+        limit_price: pre[lastIdx].limit_price
+      });
+    }
   }
 
   if (!pre.length) {

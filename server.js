@@ -159,6 +159,7 @@ const SEEN_TTL_MS = 60_000;
 
 function seenKey(msg){
   const sig = String(msg.sig_id || msg.signal_id || '');
+  const act = String(msg.action || '').toUpperCase();
   const seq = (typeof msg.seq !== 'undefined') ? String(msg.seq) : '';
   const psym = safeUpper(toProductSymbol(msg.product_symbol || msg.symbol || ''));
 
@@ -168,7 +169,11 @@ function seenKey(msg){
       ordersHash = crypto.createHash('sha1').update(JSON.stringify(msg.orders)).digest('hex');
     } catch { ordersHash = 'orders_hash_fail'; }
   }
-  const keyStr = [sig, psym, seq, ordersHash].join('|');
+  // ✅ FIX 5: Include action in dedup key so different action types
+  //   with the same sig_id/psym/seq never collide.
+  //   Also prevents retry-dedup from eating the only copy when
+  //   the first attempt is still in-flight on a different queue.
+  const keyStr = [act, sig, psym, seq, ordersHash].join('|');
   return crypto.createHash('sha1').update(keyStr).digest('hex');
 }
 
@@ -642,6 +647,10 @@ function isProtectiveOrder(o){
   return cid.startsWith(`${PROTECTIVE_PREFIX}_`);
 }
 
+// ✅ FIX 5b: isTpLikeOrder matches ONLY TP orders (T0-T5/TP prefix).
+//   Protective orders (PRT_SL_, PRT_TRL_) are NOT included here.
+//   This prevents BATCH_TPS from accidentally cancelling SL/trail orders
+//   that were placed concurrently by the PROTECT queue.
 function isTpLikeOrder(o){
   const cid = String(o?.client_order_id || '');
   return (
@@ -651,8 +660,7 @@ function isTpLikeOrder(o){
     cid.startsWith('T3') ||
     cid.startsWith('T4') ||
     cid.startsWith('T5') ||
-    cid.startsWith('TP') ||
-    cid.startsWith(`${PROTECTIVE_PREFIX}_`)
+    cid.startsWith('TP')
   );
 }
 
@@ -700,7 +708,7 @@ function clampBatchLotsToPosition(preOrders, positionLots){
   return scaled;
 }
 
-async function cancelTpAndProtectiveOrdersBySymbol(psym){
+async function cancelTpOrdersBySymbol(psym){
   const sym = toProductSymbol(psym);
   if (!sym) return { ok:true, skipped:true, reason:'missing_symbol' };
 
@@ -708,7 +716,7 @@ async function cancelTpAndProtectiveOrdersBySymbol(psym){
   try {
     open = await listOpenOrdersAllPages();
   } catch(e) {
-    throw new Error(`cancelTpAndProtectiveOrdersBySymbol list failed: ${e?.message || e}`);
+    throw new Error(`cancelTpOrdersBySymbol list failed: ${e?.message || e}`);
   }
 
   const mine = open.filter(o =>
@@ -730,7 +738,7 @@ async function cancelTpAndProtectiveOrdersBySymbol(psym){
       cancelled++;
     } catch(e){
       failed++;
-      console.warn('cancelTpAndProtectiveOrdersBySymbol failed', { sym, oid, coid, err: e?.message || e });
+      console.warn('cancelTpOrdersBySymbol failed', { sym, oid, coid, err: e?.message || e });
     }
   }
 
@@ -759,7 +767,7 @@ async function placeBatch(m){
   const entryPrice = nnum(posInfo.row?.entry_price, 0) || nnum(m.entry, 0);
   const isLong = (tpSide === 'sell');  // long → close side is sell
 
-  await cancelTpAndProtectiveOrdersBySymbol(psym);
+  await cancelTpOrdersBySymbol(psym);
 
   let pre = [];
   let skippedTps = [];
@@ -1589,7 +1597,10 @@ async function processWebhook(msg) {
   const symTV  = msg.symbol || msg.product_symbol || '';
   const psym   = toProductSymbol(symTV);
 
-  const qKey = isScopeAll(msg) ? 'GLOBAL' : `SYM:${safeUpper(psym)}`;
+  const qKey =
+    action === 'CANCEL_PROTECTIVE' || action === 'CLOSE_SL' || action === 'PLACE_SL_INTENT' || action === 'TRAIL_SL_INTENT'
+      ? protectiveKey(psym)
+      : (isScopeAll(msg) ? 'GLOBAL' : `SYM:${safeUpper(psym)}`);
 
   const out = await enqueue(qKey, async () => {
 

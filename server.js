@@ -763,6 +763,21 @@ async function placeBatch(m){
   const posInfo = await getPositionCloseSideAndLots(psym);
   if (!posInfo.hasPos) throw new Error(`placeBatch: no open position for ${psym}`);
 
+  // ✅ FIX: Use known entry lots from LAST_ENTRY_SENT instead of re-inferring
+  const knownEntry = LAST_ENTRY_SENT.get(psym);
+  if (knownEntry?.lots > 0 && (Date.now() - knownEntry.ts) < 5 * 60 * 1000) {
+    if (knownEntry.lots !== posInfo.lots) {
+      console.log('⚠ placeBatch LOT FIX: overriding inferred lots with known entry lots', {
+        psym,
+        inferredLots: posInfo.lots,
+        knownEntryLots: knownEntry.lots,
+        entrySide: knownEntry.side,
+        entryAge: `${Math.round((Date.now() - knownEntry.ts)/1000)}s ago`
+      });
+    }
+    posInfo.lots = knownEntry.lots;
+  }
+
   const tpSide = posInfo.closeSide;
   const positionLots = posInfo.lots;
 
@@ -1346,6 +1361,20 @@ async function placeSLIntent(m){
     throw new Error(`placeSLIntent: no live position found for ${psym}`);
   }
 
+  // ✅ FIX: Use known entry lots from LAST_ENTRY_SENT instead of re-inferring
+  const knownEntry = LAST_ENTRY_SENT.get(psym);
+  if (knownEntry?.lots > 0 && (Date.now() - knownEntry.ts) < 5 * 60 * 1000) {
+    if (knownEntry.lots !== info.lots) {
+      console.log('⚠ placeSLIntent LOT FIX: overriding inferred lots with known entry lots', {
+        psym,
+        inferredLots: info.lots,
+        knownEntryLots: knownEntry.lots,
+        entryAge: `${Math.round((Date.now() - knownEntry.ts)/1000)}s ago`
+      });
+    }
+    info.lots = knownEntry.lots;
+  }
+
   const stopPrice = nnum(m.stop_price, 0);
   if (!(stopPrice > 0)) throw new Error(`placeSLIntent: invalid stop_price for ${psym}`);
 
@@ -1412,6 +1441,20 @@ async function placeTrailIntent(m){
   const info = await waitUntilPositionSymbol(psym, POSITION_WAIT_MS);
   if (!info || !info.hasPos || !(info.lots > 0)) {
     throw new Error(`placeTrailIntent: no live position found for ${psym}`);
+  }
+
+  // ✅ FIX: Use known entry lots from LAST_ENTRY_SENT instead of re-inferring
+  const knownEntry = LAST_ENTRY_SENT.get(psym);
+  if (knownEntry?.lots > 0 && (Date.now() - knownEntry.ts) < 5 * 60 * 1000) {
+    if (knownEntry.lots !== info.lots) {
+      console.log('⚠ placeTrailIntent LOT FIX: overriding inferred lots with known entry lots', {
+        psym,
+        inferredLots: info.lots,
+        knownEntryLots: knownEntry.lots,
+        entryAge: `${Math.round((Date.now() - knownEntry.ts)/1000)}s ago`
+      });
+    }
+    info.lots = knownEntry.lots;
   }
 
   const trailAmount = nnum(m.trail_amount, 0);
@@ -1534,7 +1577,23 @@ async function closeSLIntent(m){
   }
 
   // Step 2: Close the position with a market order
+  // Step 2: Close the position with a market order
   const posInfo = await getPositionCloseSideAndLots(psym);
+
+  // ✅ FIX: Use known entry lots from LAST_ENTRY_SENT instead of re-inferring
+  const knownEntry = LAST_ENTRY_SENT.get(psym);
+  if (knownEntry?.lots > 0 && posInfo.hasPos && (Date.now() - knownEntry.ts) < 30 * 60 * 1000) {
+    if (knownEntry.lots !== posInfo.lots) {
+      console.log('⚠ closeSLIntent LOT FIX: overriding inferred lots with known entry lots', {
+        psym,
+        inferredLots: posInfo.lots,
+        knownEntryLots: knownEntry.lots,
+        entryAge: `${Math.round((Date.now() - knownEntry.ts)/1000)}s ago`
+      });
+    }
+    posInfo.lots = knownEntry.lots;
+  }
+
   if (!posInfo.hasPos || !(posInfo.lots > 0)) {
     console.log('CLOSE_SL: no open position found, may already be closed', { psym });
     return {

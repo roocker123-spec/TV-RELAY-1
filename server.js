@@ -840,14 +840,29 @@ async function placeBatch(m){
   if (skippedTps.length) {
     console.warn(`⚠ TP VALIDATION: ${skippedTps.length} TPs skipped for ${psym}`, { skippedTps, entryPrice, isLong });
 
-    // FIX 6: Redistribute skipped TP lots to last remaining TP (furthest from entry)
+    // FIX 6 v2: Redistribute skipped TP lots PROPORTIONALLY across remaining TPs
     const skippedLots = skippedTps.reduce((a, s) => a + (s.sizeLots || 0), 0);
     if (skippedLots > 0 && pre.length > 0) {
-      const lastIdx = pre.length - 1;
-      pre[lastIdx].sizeLots += skippedLots;
-      console.log(`⚠ TP REDISTRIBUTION [${psym}]: ${skippedLots} lots from ${skippedTps.length} skipped TPs → added to TP#${pre[lastIdx].idx} (${pre[lastIdx].limit_price})`, {
-        newSize: pre[lastIdx].sizeLots,
-        limit_price: pre[lastIdx].limit_price
+      // Calculate total original lots across remaining TPs (for proportional weight)
+      const remainingOriginalTotal = pre.reduce((a, x) => a + x.sizeLots, 0);
+ 
+      let distributed = 0;
+      for (let i = 0; i < pre.length; i++) {
+        if (i === pre.length - 1) {
+          // Last TP gets whatever remains (handles rounding)
+          pre[i].sizeLots += (skippedLots - distributed);
+        } else {
+          // Proportional share: this TP's original size / total remaining * skipped lots
+          const share = remainingOriginalTotal > 0
+            ? Math.floor(skippedLots * (pre[i].sizeLots / remainingOriginalTotal))
+            : 0;
+          pre[i].sizeLots += share;
+          distributed += share;
+        }
+      }
+ 
+      console.log(`⚠ TP REDISTRIBUTION [${psym}]: ${skippedLots} lots from ${skippedTps.length} skipped TPs → distributed proportionally across ${pre.length} remaining TPs`, {
+        redistribution: pre.map(x => ({ idx: x.idx, newSize: x.sizeLots, limit_price: x.limit_price }))
       });
     }
   }

@@ -763,21 +763,23 @@ async function placeBatch(m){
   const posInfo = await getPositionCloseSideAndLots(psym);
   if (!posInfo.hasPos) throw new Error(`placeBatch: no open position for ${psym}`);
 
-  // ✅ FIX: Use known entry lots from LAST_ENTRY_SENT instead of re-inferring
+  // ✅ FIX v2: Smart lot sizing
   const knownEntry = LAST_ENTRY_SENT.get(psym);
   if (knownEntry?.lots > 0 && (Date.now() - knownEntry.ts) < 5 * 60 * 1000) {
-    if (knownEntry.lots !== posInfo.lots) {
-      console.log('⚠ placeBatch LOT FIX: overriding inferred lots with known entry lots', {
-        psym,
-        inferredLots: posInfo.lots,
-        knownEntryLots: knownEntry.lots,
-        entrySide: knownEntry.side,
-        entryAge: `${Math.round((Date.now() - knownEntry.ts)/1000)}s ago`
+    if (posInfo.lots <= 0) {
+      posInfo.lots = knownEntry.lots;
+    } else if (posInfo.lots > knownEntry.lots) {
+      console.log('⚠ placeBatch LOT FIX: inferred > entry, using entry lots', {
+        psym, inferredLots: posInfo.lots, knownEntryLots: knownEntry.lots
+      });
+      posInfo.lots = knownEntry.lots;
+    } else if (posInfo.lots < knownEntry.lots) {
+      console.log('✓ placeBatch: position reduced by TP fills, using actual size', {
+        psym, actualLots: posInfo.lots, originalEntryLots: knownEntry.lots
       });
     }
-    posInfo.lots = knownEntry.lots;
   }
-
+ 
   const tpSide = posInfo.closeSide;
   const positionLots = posInfo.lots;
 
@@ -1376,18 +1378,28 @@ async function placeSLIntent(m){
     throw new Error(`placeSLIntent: no live position found for ${psym}`);
   }
 
-  // ✅ FIX: Use known entry lots from LAST_ENTRY_SENT instead of re-inferring
+  // ✅ FIX v2: Smart lot sizing — use actual position when TPs have reduced it
   const knownEntry = LAST_ENTRY_SENT.get(psym);
   if (knownEntry?.lots > 0 && (Date.now() - knownEntry.ts) < 5 * 60 * 1000) {
-    if (knownEntry.lots !== info.lots) {
-      console.log('⚠ placeSLIntent LOT FIX: overriding inferred lots with known entry lots', {
-        psym,
-        inferredLots: info.lots,
-        knownEntryLots: knownEntry.lots,
-        entryAge: `${Math.round((Date.now() - knownEntry.ts)/1000)}s ago`
+    if (info.lots <= 0) {
+      // Position hasn't settled yet → use known entry lots (original safety behavior)
+      console.log('placeSLIntent: position not settled, using entry lots', { psym, knownEntryLots: knownEntry.lots });
+      info.lots = knownEntry.lots;
+    } else if (info.lots > knownEntry.lots) {
+      // Inference error (lots/coins confusion) → use known entry lots (safety)
+      console.log('⚠ placeSLIntent LOT FIX: inferred > entry, using entry lots', {
+        psym, inferredLots: info.lots, knownEntryLots: knownEntry.lots
       });
+      info.lots = knownEntry.lots;
+    } else if (info.lots < knownEntry.lots) {
+      // Position is SMALLER than entry → TPs have filled → use actual position size
+      console.log('✓ placeSLIntent: position reduced by TP fills, using actual size', {
+        psym, actualLots: info.lots, originalEntryLots: knownEntry.lots,
+        tpFilledLots: knownEntry.lots - info.lots
+      });
+      // info.lots stays as-is (the correct reduced value)
     }
-    info.lots = knownEntry.lots;
+    // else: info.lots === knownEntry.lots → no change needed
   }
 
   const stopPrice = nnum(m.stop_price, 0);
@@ -1458,18 +1470,23 @@ async function placeTrailIntent(m){
     throw new Error(`placeTrailIntent: no live position found for ${psym}`);
   }
 
-  // ✅ FIX: Use known entry lots from LAST_ENTRY_SENT instead of re-inferring
+  // ✅ FIX v2: Smart lot sizing — use actual position when TPs have reduced it
   const knownEntry = LAST_ENTRY_SENT.get(psym);
   if (knownEntry?.lots > 0 && (Date.now() - knownEntry.ts) < 5 * 60 * 1000) {
-    if (knownEntry.lots !== info.lots) {
-      console.log('⚠ placeTrailIntent LOT FIX: overriding inferred lots with known entry lots', {
-        psym,
-        inferredLots: info.lots,
-        knownEntryLots: knownEntry.lots,
-        entryAge: `${Math.round((Date.now() - knownEntry.ts)/1000)}s ago`
+    if (info.lots <= 0) {
+      console.log('placeTrailIntent: position not settled, using entry lots', { psym, knownEntryLots: knownEntry.lots });
+      info.lots = knownEntry.lots;
+    } else if (info.lots > knownEntry.lots) {
+      console.log('⚠ placeTrailIntent LOT FIX: inferred > entry, using entry lots', {
+        psym, inferredLots: info.lots, knownEntryLots: knownEntry.lots
+      });
+      info.lots = knownEntry.lots;
+    } else if (info.lots < knownEntry.lots) {
+      console.log('✓ placeTrailIntent: position reduced by TP fills, using actual size', {
+        psym, actualLots: info.lots, originalEntryLots: knownEntry.lots,
+        tpFilledLots: knownEntry.lots - info.lots
       });
     }
-    info.lots = knownEntry.lots;
   }
 
   const trailAmount = nnum(m.trail_amount, 0);
@@ -1595,18 +1612,23 @@ async function closeSLIntent(m){
   // Step 2: Close the position with a market order
   const posInfo = await getPositionCloseSideAndLots(psym);
 
-  // ✅ FIX: Use known entry lots from LAST_ENTRY_SENT instead of re-inferring
+  // ✅ FIX v2: Smart lot sizing — use actual position when TPs have reduced it
   const knownEntry = LAST_ENTRY_SENT.get(psym);
   if (knownEntry?.lots > 0 && posInfo.hasPos && (Date.now() - knownEntry.ts) < 30 * 60 * 1000) {
-    if (knownEntry.lots !== posInfo.lots) {
-      console.log('⚠ closeSLIntent LOT FIX: overriding inferred lots with known entry lots', {
-        psym,
-        inferredLots: posInfo.lots,
-        knownEntryLots: knownEntry.lots,
-        entryAge: `${Math.round((Date.now() - knownEntry.ts)/1000)}s ago`
+    if (posInfo.lots <= 0) {
+      console.log('closeSLIntent: position not settled, using entry lots', { psym, knownEntryLots: knownEntry.lots });
+      posInfo.lots = knownEntry.lots;
+    } else if (posInfo.lots > knownEntry.lots) {
+      console.log('⚠ closeSLIntent LOT FIX: inferred > entry, using entry lots', {
+        psym, inferredLots: posInfo.lots, knownEntryLots: knownEntry.lots
+      });
+      posInfo.lots = knownEntry.lots;
+    } else if (posInfo.lots < knownEntry.lots) {
+      console.log('✓ closeSLIntent: position reduced by TP fills, using actual size', {
+        psym, actualLots: posInfo.lots, originalEntryLots: knownEntry.lots,
+        tpFilledLots: knownEntry.lots - posInfo.lots
       });
     }
-    posInfo.lots = knownEntry.lots;
   }
 
   if (!posInfo.hasPos || !(posInfo.lots > 0)) {

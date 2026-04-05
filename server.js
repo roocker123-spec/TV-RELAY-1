@@ -1375,7 +1375,17 @@ async function placeSLIntent(m){
   // Now wait for the NEW position to appear (up to POSITION_WAIT_MS)
   const info = await waitUntilPositionSymbol(psym, POSITION_WAIT_MS);
   if (!info || !info.hasPos || !(info.lots > 0)) {
-    throw new Error(`placeSLIntent: no live position found for ${psym}`);
+    const _lastEntry = LAST_ENTRY_SENT.get(psym);
+    const _entryAge = _lastEntry ? (Date.now() - _lastEntry.ts) : Infinity;
+    if (_entryAge > 60_000) {
+      console.log(`placeSLIntent: no position for ${psym}, cleaning up orphaned protective orders (entry was ${Math.round(_entryAge/1000)}s ago)`);
+      try { await cancelProtectiveOrdersBySymbol(psym); } catch (e) {
+        console.warn(`placeSLIntent: orphan cleanup failed for ${psym} (non-fatal):`, e?.message || e);
+      }
+    } else {
+      console.log(`placeSLIntent: no position for ${psym}, but entry is recent (${Math.round(_entryAge/1000)}s ago) — skipping cleanup`);
+    }
+    return { ok:true, action:'PLACE_SL_INTENT', symbol:psym, skipped:true, reason:'no_position_found', cleaned_up: _entryAge > 60_000 };
   }
 
   // ✅ FIX v2: Smart lot sizing — use actual position when TPs have reduced it
@@ -1467,7 +1477,17 @@ async function placeTrailIntent(m){
   // Now wait for the NEW position to appear
   const info = await waitUntilPositionSymbol(psym, POSITION_WAIT_MS);
   if (!info || !info.hasPos || !(info.lots > 0)) {
-    throw new Error(`placeTrailIntent: no live position found for ${psym}`);
+    const _lastEntry = LAST_ENTRY_SENT.get(psym);
+    const _entryAge = _lastEntry ? (Date.now() - _lastEntry.ts) : Infinity;
+    if (_entryAge > 60_000) {
+      console.log(`placeTrailIntent: no position for ${psym}, cleaning up orphaned protective orders (entry was ${Math.round(_entryAge/1000)}s ago)`);
+      try { await cancelProtectiveOrdersBySymbol(psym); } catch (e) {
+        console.warn(`placeTrailIntent: orphan cleanup failed for ${psym} (non-fatal):`, e?.message || e);
+      }
+    } else {
+      console.log(`placeTrailIntent: no position for ${psym}, but entry is recent (${Math.round(_entryAge/1000)}s ago) — skipping cleanup`);
+    }
+    return { ok:true, action:'TRAIL_SL_INTENT', symbol:psym, skipped:true, reason:'no_position_found', cleaned_up: _entryAge > 60_000 };
   }
 
   // ✅ FIX v2: Smart lot sizing — use actual position when TPs have reduced it

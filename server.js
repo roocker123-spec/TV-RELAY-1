@@ -786,7 +786,35 @@ async function placeBatch(m){
   // ✅ FIX 3: Get entry price for TP validation
   const entryPrice = nnum(posInfo.row?.entry_price, 0) || nnum(m.entry, 0);
   const isLong = (tpSide === 'sell');  // long → close side is sell
+  // ★ V05c: Recalculate TP prices from actual fill price when entry drifted
+  const actualFillPrice = nnum(posInfo.row?.entry_price, 0);
+  const atrFromPine = nnum(m.atr, 0);
+  const tpMults = Array.isArray(m.tp_mults) ? m.tp_mults.map(x => nnum(x, 0)) : [];
+  const dirFromPine = nnum(m.dir, isLong ? 1 : -1);
+  const canRecalc = actualFillPrice > 0 && atrFromPine > 0 && tpMults.length > 0;
 
+  if (canRecalc) {
+    const pineEntry = nnum(m.entry, 0);
+    const entryDrift = pineEntry > 0 ? Math.abs(actualFillPrice - pineEntry) / pineEntry * 100 : 0;
+
+    if (entryDrift > 0.5) {
+      console.log(`★ TP RECALC [${psym}]: fill=${actualFillPrice} vs pine=${pineEntry} (drift ${entryDrift.toFixed(2)}%). Recalculating TPs from fill price.`);
+
+      for (let idx = 0; idx < Math.min(m.orders.length, tpMults.length); idx++) {
+        const mult = tpMults[idx];
+        if (mult > 0) {
+          const newTpPrice = dirFromPine === 1
+            ? actualFillPrice + atrFromPine * mult
+            : actualFillPrice - atrFromPine * mult;
+
+          const oldPrice = m.orders[idx].limit_price;
+          m.orders[idx].limit_price = String(parseFloat(newTpPrice.toFixed(8)));
+
+          console.log(`  TP${idx+1}: ${oldPrice} -> ${m.orders[idx].limit_price} (${mult}x ATR from fill)`);
+        }
+      }
+    }
+  }
   await cancelTpOrdersBySymbol(psym);
 
   let pre = [];

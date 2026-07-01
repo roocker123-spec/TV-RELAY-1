@@ -27,6 +27,22 @@
 //   FIX 3: TP price validation — rejects TPs that would fill instantly at a loss
 //          (sell limit below entry for longs, buy limit above entry for shorts).
 //
+// ✅ PATCH 2026-07-01: PROTECTIVE DEDUP + RATCHET FIX (SL / TRAIL / CLOSE_SL ONLY)
+//   FIX A: Dedup key now includes stop_price / trail_amount / close_price / reason.
+//          Root cause: every PLACE_SL_INTENT shared action|sig_id|symbol|seq(=3),
+//          so the emergency SL (first to arrive) set SEEN[key] and EVERY tighter
+//          update (EARLY_BE, BE_AFTER_TP1, SL_TIGHTEN_*) hit the 60s dedup and was
+//          dropped before reaching placeSLIntent(). Result: the resting Delta stop
+//          stayed frozen at the wide emergency level and full original size, never
+//          ratcheting up to breakeven/trail. Adding the protective fields to the
+//          fingerprint lets each distinct stop update through.
+//   FIX B: Protective handlers (PLACE_SL_INTENT / TRAIL_SL_INTENT) skip the
+//          up-to-180s waitForEntryChainCompletion when a live position already
+//          exists — a ratchet is not a first placement, so no need to wait on the
+//          entry chain (which is often already TTL-expired by then). First-time
+//          placement behavior is unchanged.
+//   NOTE: Entry workflow, TP ladder, sizing, and Pine payloads are UNCHANGED.
+//
 // STRICT sequencing remains ONLY for:
 //   CANCAL(seq0) -> ENTER(seq1) -> BATCH_TPS(seq2)
 //
@@ -172,11 +188,27 @@ function seenKey(msg){
       ordersHash = crypto.createHash('sha1').update(JSON.stringify(msg.orders)).digest('hex');
     } catch { ordersHash = 'orders_hash_fail'; }
   }
+
   // ✅ FIX 5: Include action in dedup key so different action types
   //   with the same sig_id/psym/seq never collide.
   //   Also prevents retry-dedup from eating the only copy when
   //   the first attempt is still in-flight on a different queue.
-  const keyStr = [act, sig, psym, seq, ordersHash].join('|');
+  //
+  // ✅ FIX A (2026-07-01): Include protective fields so consecutive
+  //   PLACE_SL_INTENT / TRAIL_SL_INTENT / CLOSE_SL updates that share the
+  //   same action|sig_id|psym|seq are NOT deduped into a single event.
+  //   Before this, the emergency SL claimed the key and every tighten
+  //   (EARLY_BE, BE_AFTER_TP1, SL_TIGHTEN_*) was dropped within SEEN_TTL_MS,
+  //   so the exchange stop never ratcheted. These fields differ per update,
+  //   so each distinct stop level/reason now gets through. Entry-chain
+  //   messages (CANCAL/ENTER/BATCH_TPS) are unaffected — they don't carry
+  //   these fields, so their key string is identical to before.
+  const stopPx  = (typeof msg.stop_price   !== 'undefined') ? String(msg.stop_price)   : '';
+  const trailA  = (typeof msg.trail_amount !== 'undefined') ? String(msg.trail_amount) : '';
+  const closePx = (typeof msg.close_price  !== 'undefined') ? String(msg.close_price)  : '';
+  const reason  = String(msg.reason || '');
+
+  const keyStr = [act, sig, psym, seq, ordersHash, stopPx, trailA, closePx, reason].join('|');
   return crypto.createHash('sha1').update(keyStr).digest('hex');
 }
 
@@ -1381,15 +1413,29 @@ async function placeSLIntent(m){
   console.log('PLACE_SL_INTENT received', {
     sig_id: sigId,
     symbol: psym,
-    stop_price: m.stop_price
+    stop_price: m.stop_price,
+    reason: m.reason
   });
 
   if (!psym) throw new Error('placeSLIntent: missing symbol/product_symbol');
 
-  // ✅ FIX 2: Wait for the entry chain to complete (didEnter=true) instead of blind 10s sleep.
-  //   This guarantees SL placement happens AFTER the entry order fills, regardless of how long
-  //   the entry chain takes (could be 2s or 200s depending on API latency and flat-wait).
-  if (sigId) {
+  // ✅ FIX B (2026-07-01): If a position already exists, this is a RATCHET
+  //   (EARLY_BE / BE_AFTER_TP1 / SL_TIGHTEN_*), not a first placement — so we
+  //   must NOT burn up to PROTECTION_WAIT_FOR_ENTRY_MS (180s) polling for the
+  //   entry chain, which is often already TTL-expired by the time tighten
+  //   updates arrive. Only wait for the entry chain when we're genuinely NOT
+  //   in a position yet (true first-time SL placement). First-placement
+  //   behavior is byte-for-byte the same as before.
+  let preInfo = null;
+  try { preInfo = await getPositionCloseSideAndLots(psym); } catch(e) {}
+  const alreadyInPosition = !!(preInfo && preInfo.hasPos && preInfo.lots > 0);
+
+  if (alreadyInPosition) {
+    console.log(`placeSLIntent: position already open for ${psym} → ratchet update, skipping entry-chain wait`);
+  } else if (sigId) {
+    // ✅ FIX 2: Wait for the entry chain to complete (didEnter=true) instead of blind 10s sleep.
+    //   This guarantees SL placement happens AFTER the entry order fills, regardless of how long
+    //   the entry chain takes (could be 2s or 200s depending on API latency and flat-wait).
     const entryDone = await waitForEntryChainCompletion(sigId, psym);
     if (!entryDone) {
       console.warn(`placeSLIntent: entry chain never completed for ${psym} (sigId=${sigId}), proceeding anyway to check position`);
@@ -1461,6 +1507,7 @@ async function placeSLIntent(m){
     closeSide: info.closeSide,
     lots: info.lots,
     stopPrice,
+    reason: m.reason,
     client_order_id
   });
 
@@ -1475,7 +1522,7 @@ async function placeSLIntent(m){
     console.warn('placeSLIntent: cancel old protective failed (non-fatal, new SL is already placed)', { psym, err: e?.message || e });
   }
 
-  return { ok:true, action:'PLACE_SL_INTENT', symbol:psym, lots:info.lots, closeSide:info.closeSide, stopPrice, r };
+  return { ok:true, action:'PLACE_SL_INTENT', symbol:psym, lots:info.lots, closeSide:info.closeSide, stopPrice, reason: m.reason, r };
 }
 
 async function placeTrailIntent(m){
@@ -1491,8 +1538,16 @@ async function placeTrailIntent(m){
 
   if (!psym) throw new Error('placeTrailIntent: missing symbol/product_symbol');
 
-  // ✅ FIX 2: Wait for the entry chain to complete instead of blind 10s sleep
-  if (sigId) {
+  // ✅ FIX B (2026-07-01): Same ratchet short-circuit as placeSLIntent — a trail
+  //   update on an already-open position must not wait up to 180s on the entry chain.
+  let preInfoT = null;
+  try { preInfoT = await getPositionCloseSideAndLots(psym); } catch(e) {}
+  const alreadyInPositionT = !!(preInfoT && preInfoT.hasPos && preInfoT.lots > 0);
+
+  if (alreadyInPositionT) {
+    console.log(`placeTrailIntent: position already open for ${psym} → ratchet update, skipping entry-chain wait`);
+  } else if (sigId) {
+    // ✅ FIX 2: Wait for the entry chain to complete instead of blind 10s sleep
     const entryDone = await waitForEntryChainCompletion(sigId, psym);
     if (!entryDone) {
       console.warn(`placeTrailIntent: entry chain never completed for ${psym} (sigId=${sigId}), proceeding anyway to check position`);

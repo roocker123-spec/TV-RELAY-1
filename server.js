@@ -448,6 +448,46 @@ function lotsFromAmount({ amount, ccy='INR', leverage=DEFAULT_LEVERAGE, entryPxU
 
 // ---------- last entry side ----------
 const LAST_SIDE = new Map();
+// ==================== \u2605 LAYER 3: ENTRY-DRIFT CIRCUIT BREAKER ====================
+// If the REAL fill is more than MAX_ENTRY_DRIFT_PCT away from Pine's estimated
+// entry, the trade premise is dead (chart-frame vs Delta-frame divergence, e.g.
+// MUSD -19% crash: est 1.26 vs fill 1.1454). We close immediately and blacklist
+// the sig_id so late TPs/SL intents for that signal are skipped.
+const MAX_ENTRY_DRIFT_PCT = Number(process.env.MAX_ENTRY_DRIFT_PCT || 1.5);
+const ABORTED_SIGS = new Set();
+function pruneAbortedSigs(){ if (ABORTED_SIGS.size > 500) ABORTED_SIGS.clear(); }
+
+async function entryDriftGuard(psym, estEntry, sigId){
+  try {
+    if (!estEntry || !(estEntry > 0)) return { ok:true, note:'no_estimate' };
+    let fill = 0, info = null;
+    for (let i = 0; i < 6; i++) {
+      info = await getPositionCloseSideAndLots(psym).catch(()=>null);
+      if (info && info.hasPos && info.lots > 0) {
+        const rows = await listPositionsArray().catch(()=>[]);
+        const row = rows.find(p => toProductSymbol(p.product_symbol || p.symbol) === psym);
+        fill = nnum(row?.entry_price, 0);
+        if (fill > 0) break;
+      }
+      await sleep(1500);
+    }
+    if (!(fill > 0) || !info?.hasPos) return { ok:true, note:'fill_not_confirmed' };
+    const driftPct = Math.abs(fill - estEntry) / estEntry * 100;
+    if (driftPct <= MAX_ENTRY_DRIFT_PCT) {
+      console.log(`\u2713 entry drift OK ${psym}: est=${estEntry} fill=${fill} drift=${driftPct.toFixed(2)}%`);
+      return { ok:true, fill, driftPct };
+    }
+    console.error(`\u26d4 ENTRY DRIFT ABORT ${psym}: est=${estEntry} fill=${fill} drift=${driftPct.toFixed(2)}% > ${MAX_ENTRY_DRIFT_PCT}% \u2014 closing position now`);
+    await dcall('POST','/v2/orders',{ product_symbol: psym, order_type:'market_order', side: info.closeSide, size: info.lots, reduce_only: true });
+    if (sigId) { ABORTED_SIGS.add(String(sigId)); pruneAbortedSigs(); }
+    try { await cancelOrdersBySymbol(psym); } catch(e){ console.warn('drift abort: order cleanup failed (non-fatal):', e?.message || e); }
+    return { ok:false, fill, driftPct };
+  } catch (e) {
+    console.error('entryDriftGuard error (non-fatal, allowing trade):', e?.message || e);
+    return { ok:true, note:'guard_error' };
+  }
+}
+
 function rememberSide(productSymbol, side){
   if (!productSymbol) return;
   const s = String(side||'').toLowerCase()==='buy' ? 'buy' : 'sell';
@@ -1486,8 +1526,31 @@ async function placeSLIntent(m){
     // else: info.lots === knownEntry.lots → no change needed
   }
 
-  const stopPrice = nnum(m.stop_price, 0);
+  let stopPrice = nnum(m.stop_price, 0);
   if (!(stopPrice > 0)) throw new Error(`placeSLIntent: invalid stop_price for ${psym}`);
+
+  // \u2605 LAYER 4: profit-lock stops (TRAIL/TIGHTEN/BE) must sit on the PROFIT side
+  // of the REAL fill. Chart-frame trail levels computed from a stale entry can land
+  // on the LOSS side of the actual Delta fill (MUSD: trail "locked +\u20b92927" on chart
+  // = guaranteed -24 USD on exchange). We clamp to fill \u00b1 0.15%.
+  if (/TRAIL|TIGHTEN|BE/i.test(String(m.reason || ''))) {
+    try {
+      const rows = await listPositionsArray();
+      const row = rows.find(p => toProductSymbol(p.product_symbol || p.symbol) === psym);
+      const fill = nnum(row?.entry_price, 0);
+      if (fill > 0) {
+        const isLong = info.closeSide === 'sell'; // closing a long = sell
+        const buf = fill * 0.0015;
+        const bound = isLong ? (fill + buf) : (fill - buf);
+        const wrongSide = isLong ? (stopPrice < bound) : (stopPrice > bound);
+        if (wrongSide) {
+          const clamped = Number(bound.toPrecision(6));
+          console.warn(`\u26a0 LAYER4 CLAMP ${psym}: ${m.reason} stop ${stopPrice} is on LOSS side of real fill ${fill} \u2192 clamped to ${clamped}`);
+          stopPrice = clamped;
+        }
+      }
+    } catch (e) { console.warn('LAYER4 clamp check failed (non-fatal, using requested stop):', e?.message || e); }
+  }
 
   const client_order_id = protectiveClientOrderId('SL', sigId, psym);
 
@@ -1829,6 +1892,11 @@ async function processWebhook(msg) {
 
     if (action === 'EXIT') return { ok:true, ignored:'EXIT' };
 
+    // \u2605 LAYER 3: everything for an aborted signal is skipped (TPs, SL intents, trail, cleanup)
+    if (msg.sig_id && ABORTED_SIGS.has(String(msg.sig_id))) {
+      return { ok:true, skipped:'aborted_signal', action, sig_id: String(msg.sig_id) };
+    }
+
     // ---------- protection actions (OUTSIDE strict seq0/1/2 chain) ----------
     if (action === 'PLACE_SL_INTENT') {
       return await placeSLIntent(msg);
@@ -1989,6 +2057,13 @@ async function processWebhook(msg) {
       if (STRICT_SEQUENCE) setSigState(sigId, psym, { lastSeq: 1 });
 
       progressed.push({ ok:true, step:'entry', r, symbol: psym });
+
+      // \u2605 LAYER 3: entry-drift circuit breaker \u2014 abort if real fill is far from Pine's estimate
+      const _drift = await entryDriftGuard(psym, nnum(enterMsg.entry, 0), sigId);
+      if (!_drift.ok) {
+        progressed.push({ ok:false, step:'entry_drift_abort', driftPct: _drift.driftPct, fill: _drift.fill, symbol: psym });
+        return { ok:false, error:'entry_drift_abort', sig_id: sigId, symbol: psym, driftPct: _drift.driftPct, fill: _drift.fill, progressed };
+      }
     }
 
     // STEP 3: BATCH_TPS (seq2)

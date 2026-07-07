@@ -453,12 +453,13 @@ const LAST_SIDE = new Map();
 // entry, the trade premise is dead (chart-frame vs Delta-frame divergence, e.g.
 // MUSD -19% crash: est 1.26 vs fill 1.1454). We close immediately and blacklist
 // the sig_id so late TPs/SL intents for that signal are skipped.
-const MAX_ENTRY_DRIFT_PCT = Number(process.env.MAX_ENTRY_DRIFT_PCT || 1.5);
+const MAX_ENTRY_DRIFT_PCT = Number(process.env.MAX_ENTRY_DRIFT_PCT || 0);  // 0 = drift breaker DISABLED
 const ABORTED_SIGS = new Set();
 function pruneAbortedSigs(){ if (ABORTED_SIGS.size > 500) ABORTED_SIGS.clear(); }
 
 async function entryDriftGuard(psym, estEntry, sigId){
   try {
+    if (!(MAX_ENTRY_DRIFT_PCT > 0)) return { ok:true, note:'drift_guard_disabled' };  // ★ disabled: never abort
     if (!estEntry || !(estEntry > 0)) return { ok:true, note:'no_estimate' };
     let fill = 0, info = null;
     for (let i = 0; i < 6; i++) {

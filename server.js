@@ -43,6 +43,24 @@
 //          placement behavior is unchanged.
 //   NOTE: Entry workflow, TP ladder, sizing, and Pine payloads are UNCHANGED.
 //
+// ★ PATCH 2026-07-11: SL-BREACH FALLBACK + FAST RATCHET PATH
+//   Root cause observed on CHIPUSD (08:41 IST): Pine tightened the SL to 0.03271
+//   after TP2, but Delta's mark price was still at/above that level when the stop
+//   arrived → Delta rejected with 400 "immediate_execution_stop_order" and the
+//   bot just logged the error, leaving only the OLD wide stop protecting the trade.
+//   FIX C: dcall() now attaches the parsed Delta error JSON to thrown errors so
+//          handlers can react to specific error codes.
+//   FIX D: placeSLIntent/placeTrailIntent catch "immediate_execution_stop_order".
+//          That code literally means "price is already beyond your stop level",
+//          so the position is closed IMMEDIATELY at market (reduce-only) and all
+//          remaining orders for the symbol are cancelled. Behavior configurable
+//          via env SL_BREACH_ACTION = 'close' (default) | 'skip'.
+//   FIX E: Fast ratchet path — when a position already exists, placeSLIntent now
+//          reuses the position info it just fetched instead of polling positions
+//          again (waitUntilPositionSymbol) and instead of re-fetching positions a
+//          third time inside the LAYER4 clamp. Cuts several seconds of latency
+//          off every SL tighten, which is exactly when seconds matter.
+//
 // STRICT sequencing remains ONLY for:
 //   CANCAL(seq0) -> ENTER(seq1) -> BATCH_TPS(seq2)
 //
@@ -171,6 +189,12 @@ const PROTECTION_ENTRY_POLL_MS     = nnum(process.env.PROTECTION_ENTRY_POLL_MS, 
 
 // FIX 6: Minimum TP distance from entry (% of entry price)
 const MIN_TP_DISTANCE_PCT = nnum(process.env.MIN_TP_DISTANCE_PCT, 0.15);
+
+// ★ PATCH 2026-07-11 (FIX D): what to do when Delta rejects a stop with
+//   "immediate_execution_stop_order" (= price is ALREADY beyond the stop level).
+//   'close' (default) → close the position at market immediately (honors the SL intent)
+//   'skip'            → keep old protection, just log loudly (NOT recommended)
+const SL_BREACH_ACTION = String(process.env.SL_BREACH_ACTION || 'close').toLowerCase();
 
 // ---------- idempotency ----------
 const SEEN = new Map();
@@ -335,7 +359,12 @@ async function dcall(method, path, payload=null, query='') {
           await sleep(300*attempt);
           continue;
         }
-        throw new Error(`Delta API error: ${JSON.stringify({ method, url, status: res.status, json })}`);
+        // ★ PATCH 2026-07-11 (FIX C): tag the error with the parsed Delta JSON
+        //   so callers can react to specific error codes (e.g. breach fallback).
+        const err = new Error(`Delta API error: ${JSON.stringify({ method, url, status: res.status, json })}`);
+        err.deltaJson = json;
+        err.httpStatus = res.status;
+        throw err;
       }
       return json;
     } catch (e) {
@@ -344,6 +373,55 @@ async function dcall(method, path, payload=null, query='') {
     }
   }
 }
+
+// ★ PATCH 2026-07-11 (FIX C/D helpers) --------------------------------------
+function deltaErrorCode(e){
+  if (e?.deltaJson?.error?.code) return String(e.deltaJson.error.code);
+  // fallback: parse the code out of the error message string
+  const m = String(e?.message || '').match(/"code"\s*:\s*"([^"]+)"/);
+  return m ? m[1] : null;
+}
+
+function isImmediateExecutionError(e){
+  return deltaErrorCode(e) === 'immediate_execution_stop_order';
+}
+
+// Close the live position at market (reduce-only) and clean up leftover orders.
+// Used when a stop placement is rejected because price is already beyond the
+// stop level — the SL's intent ("exit here") is honored by exiting NOW.
+async function marketCloseNow(psym, reason, sigId){
+  const info = await getPositionCloseSideAndLots(psym);
+  if (!info.hasPos || !(info.lots > 0)) {
+    console.log('marketCloseNow: no open position for', psym, '(may already be closed)');
+    return { ok:true, skipped:true, reason:'no_position', symbol:psym };
+  }
+
+  const client_order_id = protectiveClientOrderId('MKT', sigId, psym);
+  const body = {
+    product_symbol: psym,
+    order_type: 'market_order',
+    side: info.closeSide,
+    size: info.lots,
+    reduce_only: true,
+    client_order_id
+  };
+
+  console.log('⚡ marketCloseNow: closing position at market', {
+    psym, side: info.closeSide, lots: info.lots, reason, client_order_id
+  });
+
+  const r = await dcall('POST', '/v2/orders', body);
+
+  // Position is gone → cancel ALL remaining orders for this symbol (TPs + old protective)
+  try {
+    await cancelOrdersBySymbol(psym);
+  } catch (e) {
+    console.warn('marketCloseNow: order cleanup failed (non-fatal)', { psym, err: e?.message || e });
+  }
+
+  return { ok:true, closed:true, symbol:psym, lots:info.lots, side:info.closeSide, reason, r: r?.result || r };
+}
+// ---------------------------------------------------------------------------
 
 // ---------- product helpers ----------
 let _products = null, _products_ts = 0;
@@ -448,7 +526,7 @@ function lotsFromAmount({ amount, ccy='INR', leverage=DEFAULT_LEVERAGE, entryPxU
 
 // ---------- last entry side ----------
 const LAST_SIDE = new Map();
-// ==================== \u2605 LAYER 3: ENTRY-DRIFT CIRCUIT BREAKER ====================
+// ==================== ★ LAYER 3: ENTRY-DRIFT CIRCUIT BREAKER ====================
 // If the REAL fill is more than MAX_ENTRY_DRIFT_PCT away from Pine's estimated
 // entry, the trade premise is dead (chart-frame vs Delta-frame divergence, e.g.
 // MUSD -19% crash: est 1.26 vs fill 1.1454). We close immediately and blacklist
@@ -475,10 +553,10 @@ async function entryDriftGuard(psym, estEntry, sigId){
     if (!(fill > 0) || !info?.hasPos) return { ok:true, note:'fill_not_confirmed' };
     const driftPct = Math.abs(fill - estEntry) / estEntry * 100;
     if (driftPct <= MAX_ENTRY_DRIFT_PCT) {
-      console.log(`\u2713 entry drift OK ${psym}: est=${estEntry} fill=${fill} drift=${driftPct.toFixed(2)}%`);
+      console.log(`✓ entry drift OK ${psym}: est=${estEntry} fill=${fill} drift=${driftPct.toFixed(2)}%`);
       return { ok:true, fill, driftPct };
     }
-    console.error(`\u26d4 ENTRY DRIFT ABORT ${psym}: est=${estEntry} fill=${fill} drift=${driftPct.toFixed(2)}% > ${MAX_ENTRY_DRIFT_PCT}% \u2014 closing position now`);
+    console.error(`⛔ ENTRY DRIFT ABORT ${psym}: est=${estEntry} fill=${fill} drift=${driftPct.toFixed(2)}% > ${MAX_ENTRY_DRIFT_PCT}% — closing position now`);
     await dcall('POST','/v2/orders',{ product_symbol: psym, order_type:'market_order', side: info.closeSide, size: info.lots, reduce_only: true });
     if (sigId) { ABORTED_SIGS.add(String(sigId)); pruneAbortedSigs(); }
     try { await cancelOrdersBySymbol(psym); } catch(e){ console.warn('drift abort: order cleanup failed (non-fatal):', e?.message || e); }
@@ -1471,8 +1549,16 @@ async function placeSLIntent(m){
   try { preInfo = await getPositionCloseSideAndLots(psym); } catch(e) {}
   const alreadyInPosition = !!(preInfo && preInfo.hasPos && preInfo.lots > 0);
 
+  // ★ PATCH 2026-07-11 (FIX E): FAST RATCHET PATH.
+  //   For ratchets, reuse the position info we just fetched instead of polling
+  //   positions AGAIN in waitUntilPositionSymbol. Every extra Delta round-trip
+  //   here is 1-2s of latency, and ratchet stops are deliberately close to
+  //   price — seconds decide whether Delta accepts or rejects the stop.
+  let info = null;
+
   if (alreadyInPosition) {
     console.log(`placeSLIntent: position already open for ${psym} → ratchet update, skipping entry-chain wait`);
+    info = preInfo; // ★ fast path: no second positions poll
   } else if (sigId) {
     // ✅ FIX 2: Wait for the entry chain to complete (didEnter=true) instead of blind 10s sleep.
     //   This guarantees SL placement happens AFTER the entry order fills, regardless of how long
@@ -1488,7 +1574,10 @@ async function placeSLIntent(m){
   }
 
   // Now wait for the NEW position to appear (up to POSITION_WAIT_MS)
-  const info = await waitUntilPositionSymbol(psym, POSITION_WAIT_MS);
+  // ★ PATCH 2026-07-11: only poll when the fast path didn't already give us the position
+  if (!info) {
+    info = await waitUntilPositionSymbol(psym, POSITION_WAIT_MS);
+  }
   if (!info || !info.hasPos || !(info.lots > 0)) {
     const _lastEntry = LAST_ENTRY_SENT.get(psym);
     const _entryAge = _lastEntry ? (Date.now() - _lastEntry.ts) : Infinity;
@@ -1530,14 +1619,19 @@ async function placeSLIntent(m){
   let stopPrice = nnum(m.stop_price, 0);
   if (!(stopPrice > 0)) throw new Error(`placeSLIntent: invalid stop_price for ${psym}`);
 
-  // \u2605 LAYER 4: profit-lock stops (TRAIL/TIGHTEN/BE) must sit on the PROFIT side
+  // ★ LAYER 4: profit-lock stops (TRAIL/TIGHTEN/BE) must sit on the PROFIT side
   // of the REAL fill. Chart-frame trail levels computed from a stale entry can land
-  // on the LOSS side of the actual Delta fill (MUSD: trail "locked +\u20b92927" on chart
-  // = guaranteed -24 USD on exchange). We clamp to fill \u00b1 0.15%.
+  // on the LOSS side of the actual Delta fill (MUSD: trail "locked +₹2927" on chart
+  // = guaranteed -24 USD on exchange). We clamp to fill ± 0.15%.
   if (/TRAIL|TIGHTEN|BE/i.test(String(m.reason || ''))) {
     try {
-      const rows = await listPositionsArray();
-      const row = rows.find(p => toProductSymbol(p.product_symbol || p.symbol) === psym);
+      // ★ PATCH 2026-07-11 (FIX E): reuse the position row we already have instead
+      //   of a THIRD positions fetch — saves another 1-2s on every tighten.
+      let row = info.row || null;
+      if (!row || !(nnum(row?.entry_price, 0) > 0)) {
+        const rows = await listPositionsArray();
+        row = rows.find(p => toProductSymbol(p.product_symbol || p.symbol) === psym);
+      }
       const fill = nnum(row?.entry_price, 0);
       if (fill > 0) {
         const isLong = info.closeSide === 'sell'; // closing a long = sell
@@ -1546,7 +1640,7 @@ async function placeSLIntent(m){
         const wrongSide = isLong ? (stopPrice < bound) : (stopPrice > bound);
         if (wrongSide) {
           const clamped = Number(bound.toPrecision(6));
-          console.warn(`\u26a0 LAYER4 CLAMP ${psym}: ${m.reason} stop ${stopPrice} is on LOSS side of real fill ${fill} \u2192 clamped to ${clamped}`);
+          console.warn(`⚠ LAYER4 CLAMP ${psym}: ${m.reason} stop ${stopPrice} is on LOSS side of real fill ${fill} → clamped to ${clamped}`);
           stopPrice = clamped;
         }
       }
@@ -1577,7 +1671,43 @@ async function placeSLIntent(m){
 
   // ✅ FIX 4: PLACE NEW SL FIRST, then cancel old protective orders.
   //   If placement fails, old SL stays in place → position never left naked.
-  const r = await dcall('POST', '/v2/orders', body);
+  // ★ PATCH 2026-07-11 (FIX D): if Delta rejects with immediate_execution_stop_order,
+  //   price is ALREADY beyond the requested stop level — the SL's intent is
+  //   "exit at this level", so we honor it by closing at market NOW instead of
+  //   silently keeping the old, wider stop.
+  let r;
+  try {
+    r = await dcall('POST', '/v2/orders', body);
+  } catch (e) {
+    if (isImmediateExecutionError(e)) {
+      console.error(`⚡ SL BREACHED ON ARRIVAL [${psym}]: stop ${stopPrice} (${m.reason}) would trigger immediately — mark price is already beyond it. SL_BREACH_ACTION=${SL_BREACH_ACTION}`);
+
+      if (SL_BREACH_ACTION === 'close') {
+        const closed = await marketCloseNow(psym, `SL_BREACH_${m.reason || 'UNKNOWN'}`, sigId);
+        return {
+          ok: true,
+          action: 'PLACE_SL_INTENT',
+          symbol: psym,
+          breach_fallback: 'market_close',
+          requestedStop: stopPrice,
+          reason: m.reason,
+          closed
+        };
+      }
+
+      console.warn(`placeSLIntent: SL_BREACH_ACTION=${SL_BREACH_ACTION} → NOT closing. Old protective order (if any) remains active for ${psym}. MANUAL ATTENTION NEEDED.`);
+      return {
+        ok: false,
+        action: 'PLACE_SL_INTENT',
+        symbol: psym,
+        breach_fallback: 'skipped',
+        requestedStop: stopPrice,
+        reason: m.reason,
+        error: 'immediate_execution_stop_order'
+      };
+    }
+    throw e;
+  }
 
   // New SL placed successfully → now safe to cancel old protective orders
   try {
@@ -1608,8 +1738,12 @@ async function placeTrailIntent(m){
   try { preInfoT = await getPositionCloseSideAndLots(psym); } catch(e) {}
   const alreadyInPositionT = !!(preInfoT && preInfoT.hasPos && preInfoT.lots > 0);
 
+  // ★ PATCH 2026-07-11 (FIX E): fast ratchet path (same as placeSLIntent)
+  let info = null;
+
   if (alreadyInPositionT) {
     console.log(`placeTrailIntent: position already open for ${psym} → ratchet update, skipping entry-chain wait`);
+    info = preInfoT; // ★ fast path: no second positions poll
   } else if (sigId) {
     // ✅ FIX 2: Wait for the entry chain to complete instead of blind 10s sleep
     const entryDone = await waitForEntryChainCompletion(sigId, psym);
@@ -1622,7 +1756,10 @@ async function placeTrailIntent(m){
   }
 
   // Now wait for the NEW position to appear
-  const info = await waitUntilPositionSymbol(psym, POSITION_WAIT_MS);
+  // ★ PATCH 2026-07-11: only poll when the fast path didn't already give us the position
+  if (!info) {
+    info = await waitUntilPositionSymbol(psym, POSITION_WAIT_MS);
+  }
   if (!info || !info.hasPos || !(info.lots > 0)) {
     const _lastEntry = LAST_ENTRY_SENT.get(psym);
     const _entryAge = _lastEntry ? (Date.now() - _lastEntry.ts) : Infinity;
@@ -1714,7 +1851,38 @@ async function placeTrailIntent(m){
 
   // ✅ FIX 4: PLACE NEW TRAIL FIRST, then cancel old protective orders.
   //   If trail placement fails, old SL stays in place → position never left naked.
-  const r = await dcall('POST', '/v2/orders', body);
+  // ★ PATCH 2026-07-11 (FIX D): same breach fallback as placeSLIntent.
+  let r;
+  try {
+    r = await dcall('POST', '/v2/orders', body);
+  } catch (e) {
+    if (isImmediateExecutionError(e)) {
+      console.error(`⚡ TRAIL BREACHED ON ARRIVAL [${psym}]: trail stop would trigger immediately. SL_BREACH_ACTION=${SL_BREACH_ACTION}`);
+
+      if (SL_BREACH_ACTION === 'close') {
+        const closed = await marketCloseNow(psym, 'TRAIL_BREACH', sigId);
+        return {
+          ok: true,
+          action: 'TRAIL_SL_INTENT',
+          symbol: psym,
+          breach_fallback: 'market_close',
+          trailAmount,
+          closed
+        };
+      }
+
+      console.warn(`placeTrailIntent: SL_BREACH_ACTION=${SL_BREACH_ACTION} → NOT closing. Old protective order (if any) remains active for ${psym}. MANUAL ATTENTION NEEDED.`);
+      return {
+        ok: false,
+        action: 'TRAIL_SL_INTENT',
+        symbol: psym,
+        breach_fallback: 'skipped',
+        trailAmount,
+        error: 'immediate_execution_stop_order'
+      };
+    }
+    throw e;
+  }
 
   // New trail placed successfully → now safe to cancel old protective orders
   try {
@@ -1775,7 +1943,6 @@ async function closeSLIntent(m){
     console.warn('CLOSE_SL cancel orders failed, continuing to close position', { psym, err: e?.message || e });
   }
 
-  // Step 2: Close the position with a market order
   // Step 2: Close the position with a market order
   const posInfo = await getPositionCloseSideAndLots(psym);
 
@@ -1893,7 +2060,7 @@ async function processWebhook(msg) {
 
     if (action === 'EXIT') return { ok:true, ignored:'EXIT' };
 
-    // \u2605 LAYER 3: everything for an aborted signal is skipped (TPs, SL intents, trail, cleanup)
+    // ★ LAYER 3: everything for an aborted signal is skipped (TPs, SL intents, trail, cleanup)
     if (msg.sig_id && ABORTED_SIGS.has(String(msg.sig_id))) {
       return { ok:true, skipped:'aborted_signal', action, sig_id: String(msg.sig_id) };
     }
@@ -2059,7 +2226,7 @@ async function processWebhook(msg) {
 
       progressed.push({ ok:true, step:'entry', r, symbol: psym });
 
-      // \u2605 LAYER 3: entry-drift circuit breaker \u2014 abort if real fill is far from Pine's estimate
+      // ★ LAYER 3: entry-drift circuit breaker — abort if real fill is far from Pine's estimate
       const _drift = await entryDriftGuard(psym, nnum(enterMsg.entry, 0), sigId);
       if (!_drift.ok) {
         progressed.push({ ok:false, step:'entry_drift_abort', driftPct: _drift.driftPct, fill: _drift.fill, symbol: psym });
@@ -2170,5 +2337,5 @@ app.post('/tv', async (req, res) => {
 });
 
 app.listen(PORT, ()=>console.log(
-  `Relay listening http://localhost:${PORT} (BASE=${BASE_URL}, AUTH=${AUTH_MODE}, STRICT_SEQUENCE=${STRICT_SEQUENCE}, FAST_ENTER=${FAST_ENTER}, SIGNAL_CHAIN_WINDOW_MS=${SIGNAL_CHAIN_WINDOW_MS}, AUTO_CANCEL_ON_ENTER=${AUTO_CANCEL_ON_ENTER}, FORCE_CLOSE_ON_CANCEL=${FORCE_CLOSE_ON_CANCEL}, CHAIN_TTL_MS=${CHAIN_TTL_MS}, PROTECTION_WAIT_FOR_ENTRY_MS=${PROTECTION_WAIT_FOR_ENTRY_MS}, INSTANT_RESPONSE=true)`
+  `Relay listening http://localhost:${PORT} (BASE=${BASE_URL}, AUTH=${AUTH_MODE}, STRICT_SEQUENCE=${STRICT_SEQUENCE}, FAST_ENTER=${FAST_ENTER}, SIGNAL_CHAIN_WINDOW_MS=${SIGNAL_CHAIN_WINDOW_MS}, AUTO_CANCEL_ON_ENTER=${AUTO_CANCEL_ON_ENTER}, FORCE_CLOSE_ON_CANCEL=${FORCE_CLOSE_ON_CANCEL}, CHAIN_TTL_MS=${CHAIN_TTL_MS}, PROTECTION_WAIT_FOR_ENTRY_MS=${PROTECTION_WAIT_FOR_ENTRY_MS}, SL_BREACH_ACTION=${SL_BREACH_ACTION}, INSTANT_RESPONSE=true)`
 ));
